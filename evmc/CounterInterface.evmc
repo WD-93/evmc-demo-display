@@ -1,0 +1,12 @@
+//Declares the interface to Counter.sol, less the hello method.
+Counter : Interface;
+//Declaring getX as x would cause functions which use x as a parameter or
+//local to fail.
+//Change vs TestABI2: no unnecessary Singletons
+getX : () -> Method Counter () Word;
+getX() := return Method 0x0c55699c;
+//inc conflicts with Arith.inc
+ctr_inc : () -> Method Counter () ();
+ctr_inc() := return Method 0x371303c0;
+incBy : () -> Method Counter Word ();
+incBy() := return Method 0x70119d06

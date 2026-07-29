@@ -1,0 +1,138 @@
+//A low-level interpreter, meant to test EVMC's suitability for interpreter
+//development. A higher-level interpreter that allowed safe cooperation between
+//users could be used as a powerful batcher.
+
+//Test script: factorial function
+/*
+fac n:
+ a = 1
+ while n:
+  a *= n
+  n--
+ return a
+
+Compiling to Instr (naive compilation):
+CDL_k <script length>
+;;If !n then return 1 else dowhile
+Jumpi_k fac
+;;return 1
+Load_k 1
+MS_k 0
+Load_k 32
+Swap_r1 //r1's initial value happens to be 0
+Return
+
+fac:
+;;n is in accum, rest are 0
+Swap_r1
+Load_k 1
+Swap_r1
+loop:
+;;(n: accum, a: r1)
+Swap_r1
+Mul_dyn
+Swap_r1
+Sub_k 1
+Jumpi_k loop
+
+;;return a
+Swap_r1
+MS_k 0
+Load_k 32
+Store_r1
+Load_k 0
+Return
+*/
+
+import Creation;
+constructor():={};
+contract text {
+
+import Prelude;
+
+//The interpreter state:
+data Regs = {Regs {
+ //The program counter; interprets from calldata
+ pc: Word,
+ //The accumulator register, used as the target for most ops
+ accum: Word,
+ //Supplementary registers
+ r1: Word,
+ r2: Word,
+ r3: Word
+ }
+};
+//An accumulator-based architecture is simple and can have a small instruction
+//set, but using them requires executing additional instructions to move data
+//between accum and supplementary registers.
+//It could be more efficient to have instruction variants that operate on
+//supplementary registers directly, or even to store registers in memory and
+//refer to them by index.
+
+//The instruction set:
+//Calling convention: dynamic arguments are taken from r_accum, then
+//r1-r3.
+data Instr r = {
+ //Load a 16b constant into r_accum
+ Load_k Short;
+ //Calldataload off a fixed offset
+ CDL_k Short;
+ //Mload off a fixed offset
+ ML_k Short;
+ //Mstore to a fixed offset
+ MS_k Short;
+ //accum <-> r storage:
+ Load_r1;
+ Load_r2;
+ Load_r3;
+ Store_r1;
+ Store_r2;
+ Store_r3;
+ Swap_r1;
+ Swap_r2;
+ Swap_r3;
+ //Control flow:
+ Jump_k Short;
+ Jumpi_k Short;
+ //Arithmetic:
+ //accum *= r1
+ Mul_dyn;
+ //accum -= imm
+ Sub_k Short;
+ //RETURN (off: accum, len: r1) 
+ Return
+} region r;
+
+dispatch : Regs -> ();
+dispatch rs := {
+ while (True) {
+ var sh;
+ case unsafeCoerce (rs.pc) :: Instr Calldata of {
+  Load_k sh => {rs.accum = coerce sh; rs.pc+=3};
+  CDL_k sh => {rs.accum = calldataload(coerce sh); rs.pc+=3};
+  ML_k sh => {rs.accum = mload(coerce sh); rs.pc+=3};
+  MS_k sh => {mstore(coerce sh, rs.accum); rs.pc+=3};
+  Load_r1 => {rs.accum = rs.r1; rs.pc++};
+  Load_r2 => {rs.accum = rs.r2; rs.pc++};
+  Load_r3 => {rs.accum = rs.r3; rs.pc++};
+  Store_r1 => {rs.r1 = rs.accum; rs.pc++};
+  Store_r2 => {rs.r2 = rs.accum; rs.pc++};
+  Store_r3 => {rs.r3 = rs.accum; rs.pc++};
+  Swap_r1 => {var tmp = rs.accum; rs.accum = rs.r1; rs.r1 = tmp; rs.pc++};
+  Swap_r2 => {var tmp = rs.accum; rs.accum = rs.r2; rs.r2 = tmp; rs.pc++};
+  Swap_r3 => {var tmp = rs.accum; rs.accum = rs.r3; rs.r3 = tmp; rs.pc++};
+  Jump_k sh => rs.pc = coerce sh;
+  Jumpi_k sh =>
+   if rs.accum
+   then rs.pc = coerce sh
+   else rs.pc += 3
+   end;
+  Mul_dyn => {rs.accum *= rs.r1; rs.pc += 1};
+  Sub_k sh => {rs.accum -= coerce sh; rs.pc += 3};
+  Return => evm_return(rs.accum,rs.r1)
+ }
+ }
+};
+
+main() := dispatch (null())
+}

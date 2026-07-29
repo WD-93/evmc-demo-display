@@ -1,0 +1,104 @@
+//Boxed in-memory arrays for ABI compatibility; not word-padded, TODO use
+//synonyms for word-padding.
+
+//Fixed-size in-memory array
+MArray : Nat -> Type -> Type;
+data MArray len a = {MArray {ma_contents: MPtr (Array len a)}};
+//Dynamically sized in-memory array
+data DMArray a = {DMArray {
+ dma_length: Short,
+ dma_contents: MPtr a
+ }
+ };
+
+//Allocate a new array; uninitialized indices may have arbitrary values.
+newMArray : () -> MArray len a;
+newMArray () := return MArray (alloc 1);
+
+newMArrayFromArray : Ptr r (Array len a) -> MArray len a;
+newMArrayFromArray arrPtr := {
+ var marr = newMArray ();
+ copy(marr.ma_contents,arrPtr,1);
+ return marr
+};
+
+newDMArray : Short -> DMArray a;
+newDMArray len :=
+ return DMArray {dma_length: len,
+                 dma_contents: alloc len
+		};
+//Sidesteps newDMArray to avoid doing redundant arithmetic
+newDMArrayFromArray : Ptr r (Array len a) -> DMArray a;
+newDMArrayFromArray arrPtr := {
+ arrPtr :: Ptr r (Array len a);
+ var len = knownNat (PN :: PN len),
+     marr = newMArrayFromArray arrPtr;
+ return DMArray {dma_length: len, dma_contents: coerce marr}
+};
+
+//No bounds check
+//TODO add *! op
+indexMArray : (MArray len a, Short) -> a;
+indexMArray (MArray arrPtr,ix) :=
+ return (*arrPtr)!ix;
+indexDMArray : (DMArray a, Short) -> a;
+indexDMArray (dma,ix) :=
+ return dma.dma_contents[ix];
+indexSolArray : (SolArray len a, Short) -> a;
+indexSolArray (sarr,ix) := return (indexMArray (sarr,ix)).unWordPad;
+indexSolDArray : (SolDArray a, Short) -> a;
+indexSolDArray (sdarr,ix) := return (indexDMArray (sdarr,ix)).unWordPad;
+
+//No bounds check
+writeMArray : (MArray len a, Short, a) -> ();
+writeMArray (MArray arrPtr,ix,a) :=
+ ((*arrPtr)!ix) = a;
+writeDMArray : (DMArray a, Short, a) -> ();
+writeDMArray (dma,ix,a) :=
+ dma.dma_contents[ix] = a;
+writeSolArray : (SolArray len a, Short, a) -> ();
+writeSolArray (sarr,ix,a) :=
+ writeMArray(sarr,ix,WordPad a);
+writeSolDArray : (SolDArray a, Short, a) -> ();
+writeSolDArray (sdarr,ix,a) :=
+ writeDMArray(sdarr,ix,WordPad a);
+
+//For ABI compatibility; note type synonyms such as SolArray are fine to use
+//in EVMC instance types!
+type SolArray len a = MArray len (WordPad a);
+type SolDArray a = DMArray (WordPad a);
+
+//TODO move to appropriate module
+//A Solidity bytes<n> type; right-padded. TODO add RightPad primitive.
+Bytes : Nat -> Type;
+data Bytes len = {Bytes {unBytes: Word}};
+//Supported for len 0..32
+str2bytes : Array len Byte -> Bytes len;
+str2bytes arr := {
+ arr :: Array len Byte;
+ var sz = knownNat (PN :: PN len);
+ return Bytes (coerce arr << (256 - 8*sz))
+};
+//No bounds check
+indexBytes : (Bytes len, Short) -> Byte;
+indexBytes (Bytes w, ix) :=
+ return (coerce w :: Array 32 Byte)!ix;
+
+//Boxed dynamically sized bytestring, equivalent to Solidity's bytes.
+data DBytes = {DBytes {unDBytes: DMArray Byte}};
+
+newDBytes : Short -> DBytes;
+newDBytes len := return DBytes (newDMArray len);
+
+str2dbytes : Array len Byte -> DBytes;
+str2dbytes arr := return ptr2dbytes (allocValue arr);
+
+ptr2dbytes : MPtr (Array len Byte) -> DBytes;
+ptr2dbytes ptr := return DBytes (newDMArrayFromArray ptr);
+
+indexDBytes : (DBytes,Short) -> Byte;
+indexDBytes (bs,ix) := return bs.unDBytes.dma_contents[ix];
+writeDBytes : (DBytes,Short,Byte) -> ();
+writeDBytes (bs,ix,b) := bs.unDBytes.dma_contents[ix] = b;
+lengthDBytes : DBytes -> Short;
+lengthDBytes bs := return bs.unDBytes.dma_length;

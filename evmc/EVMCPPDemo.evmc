@@ -1,0 +1,194 @@
+//A demo making use of the FP/OO datatypes defined in EVMCPP.
+import Creation;
+constructor():={};
+contract text {
+
+import Prelude;
+import MArray;
+import EVMCPP;
+
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ //The first byte of calldata is used to select the demo.
+ case *(null() :: Ptr Calldata Demo) of {
+  DemoClosure => demoClosure();
+  DemoObject => demoObject();
+  DemoThunk => demoThunk()
+ }
+ }
+;
+data Demo = {DemoClosure;DemoObject;DemoThunk};
+
+//EVMCPP defines three types useful for encapsulation: closures, OO objects,
+//and thunks. Each of them has a dedicated demo function.
+//Encapsulation lets users of an object remain agnostic to its underlying
+//representation, allowing the same function to operate on objects with wildly
+//different implementations.
+//It could be used to transparently insert an in-memory cache between a
+//side-effecting function and storage, for example.
+//That's an instance of the idea from 'Why FP matters': abstraction improves
+//composability, allowing functions to be decomposed, generalized and reused.
+
+//Closure demo: defining an Iterator over List and DMArray, then applying the
+//same function to sum both.
+iterList : List r a -> Iterator a;
+iterList as := return mkClosure (nextList, allocValue as);
+nextList : (MPtr (List r a),()) -> (Bool,a);
+nextList (pas,()) := {
+ var a, as;
+ case *pas of {
+  Nil => return (False,null());
+  Cons a as => {*pas = as; return (True,a)}
+  }
+};
+iterDMArray : DMArray a -> Iterator a;
+iterDMArray dma := {
+ var pa = dma.dma_contents,
+     bound = indexPtr(pa,dma.dma_length);
+ //Closing over a tuple might be faster, but it would use 10x as much memory.
+ return mkClosure(nextDMArray,allocValue (Struct(pa,bound)))
+ };
+nextDMArray : (MPtr (Struct(MPtr a, MPtr a)),()) -> (Bool,a);
+nextDMArray (ppb,()) := {
+ var p, b;
+ Struct(p,b) = *ppb;
+ if coerce p < coerce b
+ then {
+  var a = *(p++);
+  *(coerce ppb) = p;
+  return (True,a)
+  }
+ else return (False,null())
+ end
+ };
+
+//Allocate the range [a..b] : List Memory (Int s l)
+//I don't have tail-call optimization yet, so I'll use a while loop instead
+//of recursion.
+rangeList : (Int s l, Int s l) -> List Memory (Int s l);
+rangeList (lo,hi) :=
+ if lo > hi
+ then return Nil
+ else {
+  //Allocate backwards, starting from Nil.
+  //Need to be very careful about overflow here; consider s = Unsigned,
+  //lo = 0.
+  var xs = Nil;
+  while(hi > lo)
+   xs = Cons (hi--) xs;
+  xs = Cons lo xs;
+  return xs
+ }
+ end;
+
+//Ditto for a DMArray
+rangeDMArray : (Int s l, Int s l) -> DMArray (Int s l);
+rangeDMArray (lo,hi) :=
+ if lo > hi
+ then return newDMArray 0
+ else {
+  var len = coerce (hi-lo+1), //If hi-lo >= 2^16 this will truncate
+      arr = newDMArray len,
+      p = arr.dma_contents,
+      bound = indexPtr(p,len);
+  while (coerce p < coerce bound)
+   *(p++) = lo++;
+  return arr
+ }
+ end;
+ 
+//1..10, summed two ways with the same function. Not just the same definition,
+//the same instance!
+demoClosure() := {
+ rangeList(0,1);
+ var f = iterSum,
+     xs = rangeList(1,10),
+     sum_xs = f (iterList xs),
+     arr = rangeDMArray(1,10),
+     sum_arr = f (iterDMArray arr);
+ //The result should be 55 in both cases.
+ if sum_xs != 55 then returnValue 0xdead01 else {} end;
+ if sum_arr != 55 then returnValue 0xdead02 else {} end;
+ returnValue 0xa11600d //all good!
+};
+
+//Note: if EVMC had transparent coroutines a la Lua one could write iterators
+//as a single function call that yielded all the elements.
+//Currently either the consumer or producer must be called repeatedly.
+//Sadly, the EVM stack interacts poorly with coroutines - since the stack
+//isn't in memory it's not a simple matter of swapping the stack pointer.
+//It could still be done using a low-level (sub-Core) primitive that flushed
+//the stack until a special guardian value was encountered... but that might
+//interact poorly with the optimizer.
+
+//TODO
+//Need an example that can't be implemented as cleanly with closures (InChan,
+//OutChan,Iterator etc). Also worth showing: inheritance.
+demoObject() := {};
+
+//Laziness lets you decouple the producer and consumer, improving
+//composability (cf 'Why FP matters').
+//They also make allow one to transparently deal with infinite graphs.
+
+//An infinite list of a's. Since it's mutable, I actually allocate new cells
+//rather than allocate a fully evaluated cycle from the start.
+repeat : a -> LazyList a;
+repeat a := return LazyList (mkThunk (lam_repeat,a));
+//TODO implement lambdas...
+lam_repeat : MPtr a -> LazyList_ a;
+lam_repeat pa := {
+ var a = *pa;
+ return LLCons a (repeat a)
+ };
+//The first min(n,length list) elements of a lazy list
+takeLL : (Short, LazyList a) -> LazyList a;
+takeLL (n,xs) :=
+ return LazyList(mkThunk(lam_takeLL, Struct(n,xs)));
+lam_takeLL : MPtr (Struct(Short,LazyList a)) -> LazyList_ a;
+lam_takeLL pnxs := {
+ var n, th;
+ Struct(n, LazyList th) = *pnxs;
+ if n
+ then {
+  var a, xs;
+  case evalThunk th of {
+   LLNil => return LLNil;
+   LLCons a xs => return LLCons a (takeLL (n-1,xs))
+   }
+  }
+ else return LLNil
+ end
+ };
+iterLL : LazyList a -> Iterator a;
+iterLL xs := return mkClosure (nextLL, allocValue xs);
+nextLL : (MPtr (LazyList a),()) -> (Bool,a);
+nextLL (pxs,()) := {
+ var th;
+ LazyList th = *pxs;
+ var a, xs;
+ case evalThunk th of {
+  LLNil => return null();
+  LLCons a xs => {*pxs = xs; return (True,a)}
+  }
+ };
+
+//Iterators are a particular form of laziness: instead of generating the
+//entire sequence before consuming it, the iterator generates elements on
+//demand. But it can only generate a sequence - thunks can generate any
+//graph!
+data LazyTree a = {LazyTree (Thunk (LazyTree_ a))};
+data LazyTree_ a = {Empty;Node a (LazyTree a) (LazyTree a)};
+
+//An infinite tree with root 0. Each Node n has n<<1 | 0 as its left subnode,
+//and n<<1 | 1 as its right subnode.
+//TODO
+
+demoThunk() := {
+ //Takes the number of elements to sum as a 16b parameter after the demo
+ //selector.
+ var n = *(coerce 1 :: Ptr Calldata Short),
+     //An infinite list of ones
+     xs = repeat 1;
+ returnValue (iterSum (iterLL (takeLL (n,xs))))
+}
+}

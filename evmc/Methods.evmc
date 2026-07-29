@@ -1,0 +1,15 @@
+//A framework for emulating Solidity contract behavior: dispatch to a single
+//method, falling through to a payable default function if no tags match.
+
+import Prelude;
+import ABI;
+
+//Uses:
+//methods : () -> ((tag1,f1),(tag2,f2),...)
+//deflt : () -> ()
+//default is a reserved word
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ abi_handle_methods(methods());
+ deflt()
+}

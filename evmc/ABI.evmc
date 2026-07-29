@@ -1,0 +1,816 @@
+//A prototype ABI encoding and decoding API to support type-safe method calls
+//and Solidity compatibility.
+//This is NOT production ready, as the lack of validation means malicious
+//ABI encodings may either burn all gas or corrupt memory.
+
+//Design decision: use Sol-specific or native EVMC types in the ABI
+//encode/decode class?
+//Native is more convenient for the programmer and avoids conversion to/from
+//at method boundaries. The programmer must remember the C type <-> Sol type
+//mapping either way.
+//FW: map more EVMC types to ABI types; it needn't be injective.
+//Ex: lazily decode an array in a tuple.
+//If I had type families I could implement ToABI : Type -> Type.
+//handle and call_method could be extended to support a -> b s.t.
+//ToABI a, ToABI b ~ sol1, sol2.
+//Improving on Fe's sol("withdraw(uint256)"): tag@"withdraw" : () -> Method a b
+//TODO support serialization of constexpr functions in general.
+//Inferring constancy would be easier with an alloc-based memory model...
+//It would need constexpr TypeRep -> string calculation.
+//That's much better than a macro! Need to be careful to solve problems
+//elegantly rather than quickly to avoid complicating the language.
+//An interface ~ a type-level [(Atom,Type,Type)]
+
+//Encoding performance characteristics (noalloc, constexpr...) in types to
+//enforce them a la 0xCaml would be desirable.
+//Challenges:
+//1) That noalloc is possible may only become obvious after a number of opt
+//steps.
+//2) Functions must be tagged with effects or similar.
+//3) A function may have multiple possible implems with different perf chars,
+//but it can only have one type and a runtime function pointer can only have
+//one implementation.
+//Solution: a richer constraint language? That interferes with tractability of
+//type checking.
+//Overloading on perf chars for 3)? More ad hoc polymorphism means more
+//instances; it needs to be made explicit.
+//Parallel constraints (f : a -> b and has perf chars) may simplify the base
+//type system, but then the perf chars part must be able to handle it.
+//Ultimately compilation is an optimization problem where the program imposes
+//constraints...
+//Approach: attempt to compile with noalloc as a goal?
+//An allocating program with bounded alloc can always be compiled to mutate
+//an arena argument instead... is there a more fundamental effect below alloc?
+//Max_mem...?
+//If what you're worried about is a GC pause, arenas could let you erase the
+//alloc effect for arbitrary functions... modulo memory exhaustion.
+//Everything allocated would need to be copied out; thunks and other mutation
+//to external objects would be a problem.
+
+/*
+From https://docs.soliditylang.org/en/latest/abi-spec.html:
+ABI types:
+Elementary:
+uint, int <M> => UInt, Int
+address => Address
+bool => Bool
+fixed<M>x<N>, ufixed<M>x<N>
+bytes<M> => Bytes len
+function
+
+IIUC, those are all encoded as their one-word on-stack repr!
+Then I just need a class abi_elementary : Proxy a -> ().
+
+Composite or dynamic:
+T[M] => MArray len t
+(T1,T2,...) => Pair a rest, Unit
+bytes => Bytes r
+string => String r
+T[] => DMArray t
+
+*/
+
+import MArray;
+
+//My EVMC array, bytes and string types can be an unboxed struct {len,ptr}.
+//As with closures, making it 4 bytes rather than 2 makes access cheaper.
+
+//All Solidity methods belong to an interface:
+Interface : Kind;
+//revertABI requires coercing an Error arg to a Method iface arg (), but
+//iface is not specified. I'll default Interface to TrivialInterface, which
+//should be given no methods.
+TrivialInterface : Interface;
+default Interface = TrivialInterface;
+
+//ABI-compliant contracts have one or more interfaces; Contract associates a
+//contract Address with an interface it exposes.
+Contract : Interface -> Type;
+data Contract iface = {Contract {unContract: Addr}};
+
+//ABI method tags are 4 bytes; a method has an argument and return type,
+//as well as an interface of which it is a method.
+Method : Interface -> Type -> Type -> Type;
+data Method iface arg ret = {Method (UInt 4)};
+
+//An in-memory buffer for Solidity arguments
+//Structure: max content size, current content size,
+//           Method iface a b, Buffer Memory a
+//It's exclusive to Memory despite a method in calldata having the same
+//structure since the latter has unknown a and b.
+//It must be tagged with the length of its contents to pass the right
+//calldata length to call.
+data MethodBuffer a b =
+ {MethodBuffer {mb_header: (MPtr (MethodBufferHeader a b))}};
+data MethodBufferHeader a b =
+ {MBH {mbh_max_size: Short,
+       mbh_current_size: Short,
+       mbh_method_tag: UInt 4 //Interface info erased
+      } //Followed by Buffer a in memory
+ };
+//A Buffer in region r containing an ABI-encoded a; does not record its own
+//length, that's left to parent types.
+Buffer : Region -> Type -> Type;
+data Buffer r a = {Buffer (Ptr r Byte)};
+//ABI methods with a single argument or result represent them as a singleton
+//tuple.
+type Singleton a = Pair a ();
+//Convenience function:
+singleton : a -> Singleton a;
+singleton a := return (Pair a ());
+
+//newtypes to avoid confusion
+data Gas = {Gas (UInt 4)};
+//Scientific notation would be nice to have...
+//How many bits do you really need? That's a question that should be asked by
+//each application, not answered here.
+data WeiValue = {Wei (UInt 16)};
+
+//A simple method call function. Writes {method tag, encoded arg} to memOffset,
+//then decodes the returned value.
+//Does not handle memAllocPtr overflow or bad returndata, nor does it reuse
+//arguments in memory.
+//Reverts if the call fails. Uses all gas possible and pays no wei.
+abi_call_method : (Contract iface, Method iface a b, a) -> b;
+abi_call_method (c,method,arg) :=
+  return abi_call_method_buffer(c,scratchMethodBufferFromArg(method,arg));
+abi_call_method_buffer : (Contract iface, MethodBuffer a b) -> b;
+abi_call_method_buffer (Contract addr,mb) := {
+ mb :: MethodBuffer a b;
+ var ost, len;
+ (ost,len) = bufferOstLen mb;
+ if call(gas()
+         ,coerce addr
+         ,0 //value
+	 ,ost,len
+	 ,0,0 //retOst,retLen; does not copy returndata to memory
+	 )
+ then {
+  //returnValue 0xbabecafe;
+  return decode_raw (null() :: Buffer Returndata b);
+  //returnValue 0xeeee
+  }
+ else //revertPtr (coerce (mb.mb_header) ::
+      //           MPtr (Struct (MethodBufferHeader ()(),Word)))
+ revertValue "abi_call_method_buffer"
+ end
+ };
+//The offset and byte length of the buffer contents including method tag,
+//in words.
+bufferOstLen : MethodBuffer a b -> (Word,Word);
+bufferOstLen mb :=
+ return (coerce (&((mb.mb_header)->mbh_method_tag)) //argOst
+	,coerce ((mb.mb_header)->mbh_current_size) //argLen
+	);
+
+//Allocates a method buffer, but doesn't bump memAllocPtr!
+scratchMethodBufferFromArg : (Method iface a b, a) -> MethodBuffer a b;
+scratchMethodBufferFromArg (method,arg) := {
+ var mp = memAllocPtr,
+     hdrp = coerce mp;
+ var sz = encode_raw(coerce (indexPtr(hdrp,1)),
+                    arg),
+     szIncludingTag = coerce (4 + sz); //Can't forget the method tag!
+ *hdrp = MBH {mbh_max_size: szIncludingTag,
+              mbh_current_size: szIncludingTag, 
+	      mbh_method_tag: coerce method
+	     };
+ return MethodBuffer hdrp
+ };
+//Allocates a method buffer and bumps memAllocPtr; safe to persist and reuse.
+//Could be optimized to cache sz on the stack rather than storing and then
+//loading it.
+newMethodBufferFromArg : (Method iface a b, a) -> MethodBuffer a b;
+newMethodBufferFromArg marg := {
+  var mb = scratchMethodBufferFromArg marg,
+      sz = (mb.mb_header)->mbh_max_size;
+  memAllocPtr += (coerce sz +
+                  coerce (sizeof (P :: P (MethodBufferHeader () ())))
+		  );
+  return mb
+ };
+
+setMethodBufferMethod : (MethodBuffer a b, Method i a b) -> ();
+setMethodBufferMethod (mb,method) :=
+ (mb.mb_header)->mbh_method_tag = coerce method;
+//Reverts if the argument's encoding is too large; returning a Bool instead
+//would require bounds checks during encoding.
+//Since encode uses a Word to, it *probably* isn't vulnerable to overflowing
+//and corrupting memory.
+setMethodBufferArgument : (MethodBuffer a b, a) -> ();
+setMethodBufferArgument (mb,a) := {
+  var buf = coerce (indexPtr(mb.mb_header,1)),
+      sz = encode_raw(buf,a),
+      szIncludingTag = 4+sz;
+  if szIncludingTag > coerce ((mb.mb_header)->mbh_max_size)
+  //TODO create error datatype(s)
+  then revertValue "setMethodBufferArgument"
+  else ((mb.mb_header)->mbh_current_size) = coerce szIncludingTag end
+ };
+
+//ABI types are either static or dynamic; static types have a fixed-size
+//encoding.
+//enc(vs@(v1,v2,...)) = map head vs ++ map tail vs, where
+//tail (static v) = "",
+//tail (dynamic v) = enc(v)
+//head v = if v static then enc(v) else the offset of v's tail from the start
+//of the tuple. You might expect it to be relative to the head itself, but no.
+//is_dynamic is always a constant Bool, so it can be inlined and branches on
+//it can be DCE'd. It takes a proxy of the elem type.
+is_dynamic : P a -> Bool;
+instance is_dynamic : P (Int s len) -> Bool where
+ _ := return False;
+instance is_dynamic : P Address -> Bool where
+ _ := return False;
+instance is_dynamic : P Bool -> Bool where
+ _ := return False;
+instance is_dynamic : P (Bytes len) -> Bool where
+ _ := return False;
+//A static array or tuple is dynamic if any of its elements is
+instance is_dynamic : P (SolArray len a) -> Bool where
+ pma := {pma :: P (MArray len (WordPad a)); return is_dynamic (P :: P a)};
+instance is_dynamic : P () -> Bool where
+ _ := return False;
+instance is_dynamic : P (Pair a rest) -> Bool where
+ ptup := {
+  ptup :: P (Pair a rest);
+  return is_dynamic (P :: P a) | is_dynamic (P :: P rest)
+  };
+//T[] and bytes are dynamic.
+instance is_dynamic : P (SolDArray a) -> Bool where
+ _ := return True;
+instance is_dynamic : P DBytes -> Bool where
+ _ := return True;
+//TODO rename DBytes to String? I only need one of them.
+
+//The elementary types and nested tuples thereof are both static and have the
+//same representation on stack and in the encoding; we call those trivial.
+is_trivial : P a -> Bool;
+instance is_trivial : P (Int s len) -> Bool where
+ _ := return True;
+instance is_trivial : P Address -> Bool where
+ _ := return True;
+instance is_trivial : P Bool -> Bool where
+ _ := return True;
+//Boxed types are not trivial
+instance is_trivial : P (SolArray len a) -> Bool where
+ _ := return False;
+instance is_trivial : P (SolDArray a) -> Bool where
+ _ := return False;
+instance is_trivial : P DBytes -> Bool where
+ _ := return False;
+//Tuples are trivial if all their elements are trivial
+instance is_trivial : P () -> Bool where
+ _ := return True;
+instance is_trivial : P (Pair a rest) -> Bool where
+ p := {
+  p :: P (Pair a rest);
+  return is_trivial(P::P a) & is_trivial(P::P rest)
+ };
+
+//TODO fixed, function
+encode_elementary : (Word,a) -> Word;
+encode_elementary (to,x) := {mstore(to,coerce x); return 32};
+
+//Whether a type is static or dynamic, the size of the encoding of its head
+//is fixed. headEncodingSize is used in array and tuple serialization.
+headEncodingSize : P a -> Word;
+//The elementary types all have size 32
+instance headEncodingSize : P (Int s len) -> Word where
+ _ := return 32;
+instance headEncodingSize : P Address -> Word where
+ _ := return 32;
+instance headEncodingSize : P Bool -> Word where
+ _ := return 32;
+instance headEncodingSize : P (Bytes len) -> Word where
+ _ := return 32;
+//Static arrays have size len * size of their elements; dynamic arrays have
+//size 32.
+instance headEncodingSize : P (SolArray len a) -> Word where
+ p := {
+  p :: P (SolArray len a);
+  if is_dynamic (P :: P a)
+  then return 32
+  else return knownNat (PN :: PN len) * headEncodingSize (P :: P a)
+  end
+ };
+instance headEncodingSize : P (SolDArray a) -> Word where
+ _ := return 32;
+instance headEncodingSize : P DBytes -> Word where
+ _ := return 32;
+//Static tuples have size = the sum of the sizes of their elements; dynamic
+//ones have size 32.
+instance headEncodingSize : P () -> Word where
+ _ := return 0;
+instance headEncodingSize : P (Pair a rest) -> Word where
+ p := {
+  p :: P tup;
+  if is_dynamic (P :: P tup)
+  then return 32
+  else {
+   p :: P (Pair a rest);
+   return headEncodingSize (P :: P a) + headEncodingSize (P :: P rest)
+  }
+  end
+ };
+
+//to : Word, the raw encoder which typed versions wrap.
+//Returns the size of the resulting encoding.
+//Makes no buffer size check!
+encode_raw : (Word,a) -> Word;
+
+//Elementary instances
+instance encode_raw : (Word,Int s len) -> Word where
+ x := return encode_elementary x;
+instance encode_raw : (Word,Address) -> Word where
+ x := return encode_elementary x;
+instance encode_raw : (Word,Bool) -> Word where
+ x := return encode_elementary x;
+instance encode_raw : (Word,Bytes len) -> Word where
+ x := return encode_elementary x;
+instance encode_raw : (Word,()) -> Word where
+ _ := return 0;
+
+//The tricky instances
+instance encode_raw : (Word, SolArray len a) -> Word where
+ (to,marr) := {
+  marr :: SolArray len a;
+  var len = knownNatWord (PN :: PN len);
+  if is_trivial (P :: P a)
+  then {
+   copy(coerce to, marr.ma_contents, 1);
+   return coerce (sizeof (P :: P (Array len (WordPad a))))
+   }
+  else {} end;
+  if is_dynamic (P :: P a)
+  then {
+   //The head is len words
+   //Decaying a[] to a* for efficiency 
+   var hp = to, tp = to + len << 5,
+       bound = tp,
+       ptr = coerce (marr.ma_contents) :: MPtr (WordPad a);
+   //Push each elem to tp, write its offset off to
+   while (hp < bound) {
+    mstore(hp,tp-to);
+    hp += 32;
+    tp += encode_raw(tp,(*(ptr++)).unWordPad)
+   };
+   return tp-to
+  }
+  else {
+   //Each element has the same static encoding size
+   //(distinct from its size on stack since
+   //static arrays are boxed).
+   var sz = headEncodingSize (P :: P a),
+       bound = to + len*sz,
+       ptr = coerce (marr.ma_contents) :: MPtr (WordPad a);
+   while (to < bound)
+    //This is actually just adding sz to to; make explicit for perf?
+    to += encode_raw(to,(*(ptr++)).unWordPad);
+   //Equal to bound-to
+   return headEncodingSize (P :: P (SolArray len a))
+  } end
+ };
+
+//Unlike SolArray len a, SolDArray a is always dynamic.
+instance encode_raw : (Word, SolDArray a) -> Word where
+ (to,dmarr) := {
+  dmarr :: SolDArray a;
+  var len = dmarr.dma_length;
+  mstore(to,coerce len);
+  to+=32;
+  if is_trivial (P :: P a)
+  then {
+   copy(coerce to, dmarr.dma_contents, len);
+   return (coerce len + 1) << 5
+  } else {} end;
+  //Copied from SolArray instance; TODO deduplicate
+  if is_dynamic (P :: P a)
+  then {
+   //The head is len words
+   //Decaying a[] to a* for efficiency 
+   var hp = to, tp = to + coerce len << 5,
+       bound = tp,
+       ptr = dmarr.dma_contents;
+   //Push each elem to tp, write its offset off to
+   while (hp < bound) {
+    mstore(hp,tp-to);
+    hp += 32;
+    tp += encode_raw(tp,(*(ptr++)).unWordPad)
+   };
+   return tp-to
+  }
+  else {
+   //Each element has the same static encoding size
+   //(distinct from its size on stack since
+   //static arrays are boxed).
+   var sz = headEncodingSize (P :: P a),
+       bound = to + coerce len * sz,
+       ptr = dmarr.dma_contents;
+   while (to < bound)
+    //This is actually just adding sz to to; make explicit for perf?
+    to += encode_raw(to,(*(ptr++)).unWordPad);
+   //Equal to bound-to
+   return coerce len * sz
+  } end
+ };
+
+//Round up lengthDBytes to 32n, write length to first word, rest to remainder,
+//return 32+rounded up length.
+//Note: there's no guarantee the memory encoded to is initially 0!
+//Zeroing the last word should only be done if len > 0. Two mcopies increases
+//the cost to 6/w...
+//If only there was scratch at 0 so I could do mstore(cond*ptr,w) to redirect
+//the write if !cond.
+//TODO check if the Sol ABI decoder rejects strings which aren't right-padded
+//with zeroes; if not I could just mcopy wlen, though that leaks info.
+//Nothing is secret on the blockchain, but giving attackers access to the info
+//from within a smart contract (allowing synchronous response) could be a
+//problem.
+instance encode_raw : (Word, DBytes) -> Word where
+ (to,bs) := {
+  var len = lengthDBytes bs,
+      wlen = coerce (roundUpMod32 len);
+  mstore(to,coerce len);
+  var dst = to+32,
+      src = bs.unDBytes.dma_contents;
+  if len
+  then {
+   //Zero last 32b
+   mstore (dst + wlen - 32, 0);
+   copy(unsafeCoerce dst,src,len)
+  }
+  else {} end;
+  return wlen + 32
+ };
+//Rounds n up to the closest multiple of 32. Branchless.
+roundUpMod32 : UInt len -> UInt len;
+roundUpMod32 n := {
+ var w = coerce n,
+     m = and(31,w),
+     needsRoundUp = iszero(iszero m),
+     addendum = needsRoundUp * (32 - m);
+ return coerce (addendum + w)
+};
+
+instance encode_raw : (Word, Pair a tup) -> Word where
+ (to,tup) := return encode_tup (to,tup);
+
+//encode_tup is similar to encode_raw on arrays except the looping is done
+//via recursive overloading rather than a while. That means that locals
+//(hp,tp etc) are replaced with params to helpers.
+//It need not support () since the initial tuple is guaranteed to be
+//nonempty.
+encode_tup : (Word, Pair a rest) -> Word;
+encode_tup (to,tup) := {
+ tup :: tup;
+ if is_trivial (P :: P tup)
+ then {
+  *(coerce to) = tup;
+  return coerce (sizeof (P :: P tup))
+ }
+ else {} end;
+ if is_dynamic (P :: P tup)
+ then {
+  var hp = to,
+      tp = to + headEncodingSize (P :: P tup);
+  tp = encode_dynamic_tup (to,hp,tp,tup);
+  return tp-to
+ }
+ else return encode_static_tup(to,tup) - to
+ end
+};
+//By returning the final tp instead of computing size I can make it
+//internally tail recursive (though I don't have TCO yet).
+encode_dynamic_tup : (Word,Word,Word,a) -> Word;
+instance encode_dynamic_tup : (Word,Word,Word,()) -> Word where
+ (to,hp,tp,()) := return tp;
+instance encode_dynamic_tup : (Word,Word,Word,Pair a rest) -> Word where
+ (to,hp,tp,Pair a rest) := {
+  a :: a;
+  if is_dynamic (P :: P a)
+  then {
+   mstore(hp,tp-to);
+   hp += 32;
+   tp += encode_raw(tp,a);
+   }
+  else {
+   hp += encode_raw(hp,a);
+  }
+  end;
+  //This should be inlined into both ifte branches once I have aggressive
+  //inlining.
+  return encode_dynamic_tup(to,hp,tp,rest)
+ };
+//I use the same "return final alloc pointer" trick in encode_static_tup.
+encode_static_tup : (Word,a) -> Word;
+instance encode_static_tup : (Word,()) -> Word where
+ (to,()) := return to;
+instance encode_static_tup : (Word,Pair a rest) -> Word where
+ (to,Pair a rest) := {
+  to += encode_raw(to,a);
+  return encode_static_tup(to,rest)
+ };
+
+//FW: partial decoding such as Buffer r (a,b) -> (Buffer r a, Buffer r b),
+//implementation via mapping over tuples using type families,
+//validation.
+
+//Raw ABI encoding. Needs to take a Buffer rather than a Word to represent
+//which region is being decoded.
+//Code and Returndata do not support load, so their dereference op requires
+//copying to memory first; the deref implementation copies to memAllocPtr.
+//Since decoded arrays must be allocated, I therefore use a wrapper around word
+//deref to ensure it gets copied to &scratch instead.
+//Does not check the encoding is valid; malicious array encodings with very
+//large lengths can burn all of the contract's gas.
+//That's not really a problem for calldata, but it is for returndata.
+//An array large enough to overflow alloc could corrupt memory; that is a
+//problem for calldata.
+decode_raw : Buffer r a -> a;
+
+//Elementary instances
+instance decode_raw : Buffer r (Int s len) -> (Int s len) where
+ buf := return decode_elementary buf;
+instance decode_raw : Buffer r Address -> Address where
+ buf := return decode_elementary buf;
+instance decode_raw : Buffer r Bool -> Bool where
+ buf := return decode_elementary buf;
+instance decode_raw : Buffer r (Bytes n) -> Bytes n where
+ buf := return decode_elementary buf;
+
+//Treat the buffer as a word pointer and dereference it, using scratch instead
+//of memAllocPtr if that requires a copy. Only safe for types with sizeof 32.
+decode_elementary : Buffer r a -> a;
+decode_elementary buf := {
+ buf :: Buffer r a;
+ return safeDeref (coerce buf :: Ptr r Word)
+ };
+//unsafeCoerce avoids masking
+//For larger types, use safeDerefAlloc.
+safeDeref : Ptr r Word -> a;
+instance safeDeref : Ptr Memory Word -> a where
+ ptr := return unsafeCoerce (*ptr);
+instance safeDeref : Ptr Calldata Word -> a where
+ ptr := return unsafeCoerce (*ptr);
+//Buffers are never in Storage or TStorage
+instance safeDeref : Ptr Returndata Word -> a where
+ ptr := return safeCopyDeref ptr;
+instance safeDeref : Ptr Code Word -> a where
+ ptr := return safeCopyDeref ptr;
+safeCopyDeref : Ptr r Word -> a;
+safeCopyDeref ptr := {copy(&scratch,ptr,1);return unsafeCoerce scratch};
+
+instance decode_raw : Buffer r (SolArray len a) -> SolArray len a where
+ buf := {
+  buf :: Buffer r (SolArray len a);
+  if is_trivial (P :: P a)
+  then {
+   var arrPtr = coerce buf :: Ptr r (Array len (WordPad a));
+   return newMArrayFromArray arrPtr
+  }
+  else {}
+  end;
+  var sarr = newMArray();
+  if is_dynamic (P :: P a)
+  then {
+   var from = coerce buf :: Ptr r Word,
+       to = coerce sarr :: MPtr (WordPad a),
+       bound = indexPtr(to,knownNat (PN :: PN len));
+   while (coerce to < coerce bound) { //< only supported for Int
+    var off = safeDeref (from++),
+        elemBuf = coerce (add(coerce buf, off)) :: Buffer r a;
+    *(to++) = WordPad (decode_raw elemBuf)
+   }
+  }
+  else {
+   var from = coerce buf :: Word,
+       to = coerce sarr :: MPtr (WordPad a),
+       sz = headEncodingSize (P :: P a),
+       bound = from + knownNat (PN :: PN len) * sz;
+   while (from < bound) {
+    *(to++) = WordPad (decode_raw (coerce from :: Buffer r a));
+    from += sz
+   }
+  }
+  end;
+  return sarr
+ };
+instance decode_raw : Buffer r (SolDArray a) -> SolDArray a where
+ buf := {
+  buf :: Buffer r (SolDArray a);
+  var lenp = coerce buf :: Ptr r Word,
+      len = safeDeref lenp;
+  var dst = alloc len;
+  if is_trivial (P :: P a)
+  then {
+   var src = unsafeCoerce (coerce buf + 32) :: Ptr r (WordPad a);
+   copy(dst,src,len);
+  }
+  else {
+   //Adapted from SolArray instance; TODO deduplicate
+   if is_dynamic (P :: P a)
+   then {
+   //I'd misread the ABI spec on dynamic arrays: its encoding consists of the
+   //length followed by the encoding of the tuple of its elements; the base
+   //for computing the offsets is the address of the start of the tuple,
+   //not the length.
+   //Source: https://docs.soliditylang.org/en/latest/abi-spec.html ('26-07-26)
+   var base = indexPtr(coerce buf,1) :: Ptr r Word,
+       from = base,
+       to = dst,
+       bound = indexPtr(to,len);
+   while (coerce to < coerce bound) { //< only supported for Int
+    var off = safeDeref (from++),
+        elemBuf = unsafeCoerce (add(coerce base, off)) :: Buffer r a;
+    *(to++) = WordPad (decode_raw elemBuf)
+   }
+  }
+  else {
+   var from = coerce buf + 32 :: Word,
+       to = dst,
+       sz = headEncodingSize (P :: P a),
+       bound = from + coerce len * sz;
+   while (from < bound) {
+    *(to++) = WordPad (decode_raw (coerce from :: Buffer r a));
+    from += sz
+   }
+  }
+  end
+  }
+  end;
+  return DMArray {dma_length: len, dma_contents: dst}
+ };
+//Assumes byte length < 2^16!
+instance decode_raw : Buffer r DBytes -> DBytes where
+ buf := {
+  buf :: Buffer r DBytes;
+  var lenp = coerce buf :: Ptr r Word;
+  var wbuf = coerce buf,
+      len = coerce (safeDeref lenp),
+      bp = alloc len;
+  copy(coerce bp,unsafeCoerce (32+wbuf) :: Ptr r Byte,len);
+  return DBytes (DMArray{dma_length: len,dma_contents:bp})
+ };
+
+instance decode_raw : Buffer r () -> () where
+ _ := return ();
+instance decode_raw : Buffer r (Pair a rest) -> Pair a rest where
+ buf := {
+  buf :: Buffer r tup;
+  if is_trivial (P :: P tup)
+  //deref of Code and Returndata copies to memAllocPtr before the copied data
+  //gets mloaded. That means saving memAllocPtr and incrementally writing to
+  //it before bumping is not safe if you call decode_raw between the save
+  //and bump; alloc to reserve space first instead.
+  //I can't avoid that since tup may be too large to fit in scratch.
+  then {
+   //returnValue 0xbeefcace;
+   return *(coerce buf :: Ptr r tup);
+   //var val = instrumentedDeref (coerce buf :: Ptr r tup);
+   }
+  else return decode_tuple (PR :: PR r, coerce buf, coerce buf)
+  end
+ };
+
+//deref@Returndata seems to revert!
+instrumentedDeref : Ptr r a -> a;
+instance instrumentedDeref : Ptr Returndata a -> a where
+  p := {
+ var tmp = coerce memAllocPtr;
+ //returnValue (tmp,p,1); //0x1337;
+ instrumentedCopy(tmp,p,1);
+ returnValue 0xbeefbeef;
+ return *(tmp :: MPtr a)
+};
+instrumentedCopy : (MPtr a, Ptr r a, Short) -> ();
+instance instrumentedCopy : (MPtr a, Ptr Returndata a, Short) -> () where
+ (to,from,n) := {
+ var len = sizeofPtrLen(to,n);
+ //returnValue 0xa000;
+ //returnValue (returndatasize());
+ returndatacopy(64,0,0);
+ //returndatacopy(coerce to,coerce from,coerce len);
+ returnValue 0xeefbeef
+};
+
+//Decoding a tuple: for each head in heads:
+//If type is static, decode head.
+//Else compute offset from base and head, then decode that.
+//Takes region as a proxy argument.
+decode_tuple : (PR r,Word,Word) -> a;
+instance decode_tuple : (PR r,Word,Word) -> () where
+ _ := return ();
+instance decode_tuple : (PR r,Word,Word) -> Pair a rest where
+ (pr,base,hp) := {
+  pr :: PR r;
+  if is_dynamic (P :: P a)
+  then {
+   var off = safeDeref (coerce hp :: Ptr r Word),
+       elemBuf = coerce (base + off) :: Buffer r a;
+   var a = decode_raw elemBuf;
+   var rest = decode_tuple(pr,base,hp+32);
+   return Pair a rest :: Pair a rest
+  }
+  else {
+   var elemBuf = coerce hp :: Buffer r a,
+       a = decode_raw elemBuf,
+       rest = decode_tuple(pr,base,hp + headEncodingSize (P :: P a));
+   return Pair a rest
+  }
+  end
+  };
+
+//Additional key ABI functions:
+
+//Given a method tag and function, decodes the calldata, passes it to the
+//function, then encodes and RETURNs the result.
+//If the method tag in calldata doesn't match, does nothing.
+abi_handle_method : (Method iface a b, a -> b) -> ();
+abi_handle_method(method,f) :=
+ //TODO define function for constraining pointer region
+ if *(null() :: Ptr Calldata t) == method
+ then returnABI(f(decode_raw (coerce 4 :: Buffer Calldata a)))
+ else {}  end;
+
+//Given a tuple of (Method a b, a -> b) pairs (for different a,b for each
+//pair), calls abi_handle_method on each.
+//Note: without optimization, all of them will be on the stack at once!
+abi_handle_methods : a -> ();
+instance abi_handle_methods : () -> () where
+ _ := {};
+instance abi_handle_methods : Pair (Method iface a b, a -> b) rest -> () where
+ (Pair mf rest) := {abi_handle_method mf; abi_handle_methods rest};
+
+//Encode a and RETURN it.
+//encode_raw uses memAllocPtr, so need to be careful not to clobber it.
+//a may also refer to allocated data, so need to alloc the encoding off
+//memAllocPtr.
+returnABI : a -> ();
+returnABI a := {
+  var mp = memAllocPtr;
+  var sz = encode_raw(mp,a);
+  evm_return(mp,sz)
+ };
+//A custom error Foo(a:T1,b:T2,c:T3) has the same encoding as a method with
+//that name and type. Since errors don't have a return type, they deserve
+//a new datatype analogous to Method.
+//try-catch doesn't yet support user-defined errors, but it's planned.
+//Sources:
+//https://docs.soliditylang.org/en/latest/abi-spec.html#errors
+//https://docs.soliditylang.org/en/v0.8.36/control-structures.html#try-catch
+//Fetched 2026-07-17.
+data Error arg = {Error (UInt 4)};
+revertABI : (Error arg,arg) -> ();
+revertABI (err,arg) := {
+ err :: Error arg;
+ var buf = scratchMethodBufferFromArg(coerce err :: Method iface arg (),arg),
+     ostlen = bufferOstLen buf;
+ revert ostlen
+};
+//The tag of Error
+abi_tag_Error : () -> Error (Singleton DBytes);
+abi_tag_Error() := return Error 0x08c379a0;
+//The tag of Panic
+abi_tag_Panic : () -> Error Word;
+abi_tag_Panic() := return Error 0x4e487b71;
+
+//Throw a small on-stack string
+//The short name is problematic; TODO permit locals to shadow globals and
+//funs.
+error : Array len Byte -> ();
+error str := errorDBytes (str2dbytes str);
+//Throw an in-memory string
+errorDBytes : DBytes -> ();
+errorDBytes db := revertABI (abi_tag_Error(), Pair db ());
+panic : Word -> ();
+panic w := revertABI (abi_tag_Panic(),w);
+
+//Sol-style logging.
+//The log constructor is treated as a topic, but it should constrain the
+//indexed and unindexed field types.
+//Those are explicitly split in EVMC, unlike Solidity where indexed and
+//unindexed fields may be mixed.
+data Event ixTup unixTup = {Event (UInt 4)};
+/*
+Example:
+event Transfer(
+    address indexed from,
+    address indexed to,
+    uint256 value
+);
+becomes
+transfer() : Event (Address,Address) (Singleton Word);
+transfer() := Event <keccak256("Transfer(address,address,uint256)")>;
+emit Transfer(from,to,value)
+becomes
+abi_emit(transfer(),(from,to),singleton value)
+*/
+abi_emit : (Event ixTup unixTup,ixTup,unixTup) -> ();
+abi_emit _ := {};
+
+//Dynamic indexed types are hashed before they're used as a topic; the
+//full value is not included in the message.
+//The encoding function is distinct from that used by the ABI.
+encodeTopic_raw : a -> Word;
+encodeTopic_raw _ := {}

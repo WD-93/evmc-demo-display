@@ -1,0 +1,85 @@
+//Testing ABI encoding of static and dynamic arrays
+
+import Creation;
+constructor():={};
+contract text {
+import Prelude;
+import ABI;
+//import Methods;
+
+/*I encountered a codegen error in abi_handle_methods (swap out of range)
+after adding a fourth method. Using abi_handle_method for now...
+methods():=return (
+ (m_idStatic(),idStatic)
+,(m_idDynamic(),idDynamic)
+,(m_idNested(),idNested)
+,(m_sumOfSums(),sumOfSums)
+);
+deflt():= error "No method tag matched!";
+*/
+
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ abi_handle_method(m_idStatic(),idStatic);
+ abi_handle_method(m_idDynamic(),idDynamic);
+ abi_handle_method(m_idNested(),idNested);
+ abi_handle_method(m_sumOfSums(),sumOfSums);
+ error "No method tag matched!"
+};
+
+TAA : Interface;
+type Len = 4;
+//ethers.id("idStatic(uint256[4])").substr(0,10)
+m_idStatic : () -> Method TAA (Singleton (SolArray Len Word))
+                   (Singleton (SolArray Len Word));
+m_idStatic() := return Method 0x05c84204;
+//"idDynamic(uint256[])"
+m_idDynamic : () -> Method TAA (Singleton (SolDArray Word))
+                    (Singleton (SolDArray Word));
+m_idDynamic() := return Method 0x44d53953;
+m_idNested : () -> Method TAA
+ (Singleton (SolDArray(SolDArray Word)))
+ (Singleton (SolDArray(SolDArray Word)));
+m_idNested() := return Method 0xb3f11d79;
+m_sumOfSums : () -> Method TAA (Singleton (SolDArray(SolDArray Word))) Word;
+m_sumOfSums() := return Method 0x8d466fdf;
+
+idStatic : Singleton (SolArray Len Word) -> Singleton (SolArray Len Word);
+idStatic (Pair arr()) := return Pair arr ();
+idDynamic : Singleton (SolDArray Word) -> Singleton (SolDArray Word);
+idDynamic (Pair arr()) := return Pair arr ();
+idNested : Singleton (SolDArray(SolDArray Word)) ->
+           Singleton (SolDArray(SolDArray Word));
+idNested (Pair arr()) :=
+ //revertValue (msize());
+ return Pair arr ();
+//A more interesting method, testing nested dynamic array encoding.
+//Opt: the words will actually be allocated contiguously... I need
+//only sum the sizes in a first pass, then iterate over the contents in a
+//single loop.
+//No, arrays are prefixed by their length so that doesn't work...
+sumOfSums : Singleton (SolDArray(SolDArray Word)) -> Word;
+sumOfSums (Pair arr_arr_w()) := {
+ var accum = 0,
+     len = arr_arr_w.dma_length;
+ for(var i = 0; i < len; i++){
+  var arr_w = indexSolDArray(arr_arr_w,i),
+      len = arr_w.dma_length;
+  for(var i = 0; i < len; i++)
+   accum += indexSolDArray(arr_w,i)
+ };
+ return accum
+};
+//TODO reimplement with foldr
+totalLength : SolDArray(SolDArray a) -> Short;
+totalLength arr_arr_a := {
+ var p = arr_arr_a.dma_contents,
+     bound = indexPtr(p,arr_arr_a.dma_length),
+     accum = 0;
+ while(coerce p < coerce bound) {
+  var w_arr_a = *(p++);
+  accum += w_arr_a.unWordPad.dma_length
+ };
+ return accum
+}
+}

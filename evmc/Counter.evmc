@@ -1,0 +1,40 @@
+import Prelude;
+
+main() := {
+ var p = alloc 1;
+ copy(p,&counter,1);
+ returnPtr p
+};
+
+contract counter {
+import Prelude;
+import ABI;
+import CounterInterface;
+
+main() := {
+ abi_handle_methods (
+  (getX(),get)
+ ,(ctr_inc(),f_ctr_inc)
+ ,(incBy(),f_incBy)
+ );
+ //Report the offending tag if none match
+ revertValue (*(null() :: Ptr Calldata (UInt 4)))
+};
+
+//Byte-aligned Storage pointers are a costly abstraction; using sload/sstore
+//instead.
+get() := return sload 0;
+put x := return sstore (0,x);
+
+//Difference vs Counter: does not revert if paid;
+//TODO give handle_method a non-payable variant.
+//Also doesn't throw an informative error string; TODO implement error str.
+//Doesn't log Increment events; TODO support ABI log.
+//Annoyance: need to return to avoid return type defaulting to Word.
+f_ctr_inc() := return put(1+get());
+f_incBy amt :=
+ if amt
+ then return put(amt + get())
+ else revertValue (0xdead :: Short)
+ end
+}

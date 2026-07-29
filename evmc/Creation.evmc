@@ -1,0 +1,20 @@
+//A framework for making default logic for contract creation more convenient.
+//The difference between a framework and a library is that you call libraries,
+//but frameworks call you.
+
+import Prelude;
+import ABI;
+
+//Uses:
+//constructor : abiT -> ()
+//text : Array len Byte, a contract object
+//text is fixed and doesn't get passed an argument of its own.
+//I also don't support immutable globals.
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ var conArg = coerce (&codeOffset);
+ constructor (decode_raw conArg);
+ var p = alloc 1;
+ copy(p,&text,1);
+ returnPtr p
+}

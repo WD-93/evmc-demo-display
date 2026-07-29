@@ -1,0 +1,155 @@
+//EVMC's type system is rich enough to encode OO!
+//OO polymorphism ~ existential quantification over the enclosed state type;
+//it's independently useful alongside template polymorphism for dynamic
+//dispatch.
+
+import ABI; //Just used for error in evalThunk
+
+//NB: under EVMC's current coarse-grained memory model, calling function
+//pointers from memory may wreck optimization.
+//EVMC currently treats memory as a raw bytestring (with no assumptions about
+//pointer aliasing), and abstract interpretation doesn't recognize when
+//pointer writes don't overlap. A call of a function loaded from memory will
+//be considered to potentially jump to any function ever written to memory,
+//including those of the wrong type.
+
+//Closures are an object with a single method: .call(arg). They enclose some
+//mutable state c.
+//A new Unit-like datatype to make it explicit you shouldn't use it:
+data Hidden = {};
+data Closure a b =
+ {Closure {
+   c_fptr : (MPtr Hidden, a) -> b,
+   c_closed : MPtr Hidden
+   }
+ };
+//TODO a variant which takes a c... that's often what you want, but only
+//supporting that would prevent sharing of the closed value.
+mkClosure : ((MPtr c, a) -> b, MPtr c) -> Closure a b;
+mkClosure (f,c) := return Closure {c_fptr: coerce f, c_closed: coerce c};
+callClosure : (Closure a b, a) -> b;
+callClosure (c,a) := return c.c_fptr(c.c_closed,a);
+
+//Read and write channels can be implemented using closures.
+type OutChan a = Closure () a;
+type InChan a = Closure a ();
+readChan : OutChan a -> a;
+readChan out := return callClosure (out,());
+writeChan : (InChan a, a) -> ();
+writeChan (in,a) := callClosure(in,a);
+//That can be used to model value sources which never run out, but if you're
+//traversing the elements of a data structure (e.g. an array or tree) you need
+//to stop at some point.
+//Iterators are like OutChans enhanced with a Bool indicating whether you've
+//run out of values to consume; if the Bool is false then the a returned is
+//invalid and should be ignored.
+type Iterator a = Closure () (Bool,a);
+iter_next : Iterator a -> (Bool,a);
+iter_next iter := return callClosure(iter,());
+//Perform an action for each element in the iterator.
+iterFor : (a -> (), Iterator a) -> ();
+iterFor (f,iter) := {
+ var cont, a;
+ (cont,a) = iter_next iter;
+ while (cont) {
+  f a;
+  (cont,a) = iter_next iter;
+ }
+};
+//Fold over the elements in the iterator.
+iterFold : ((a,b) -> b, b, Iterator a) -> b;
+iterFold (f,b,iter) := {
+ var cont, a;
+ (cont,a) = iter_next iter;
+ while (cont) {
+  b = f (a,b);
+  (cont,a) = iter_next iter
+ };
+ return b
+};
+iterSum : Iterator (Int s len) -> Int s len;
+iterSum iter := return iterFold(plus,0,iter);
+
+//Objects can be viewed as a generalization of closures
+//Its unboxed repr is a memory pointer to a method table that operates on its
+//closed state, followed by the closed state.
+//Note the mtbl methods can't refer to c, or they'll be converted to Hidden
+//in Object.
+Object_ : (Type -> Type) -> Type -> Type;
+data Object_ mtbl c = {Object_ {o_mtbl: MPtr (mtbl c), o_closed: c}};
+Object : (Type -> Type) -> Type;
+data Object mtbl = {Object {unObject: MPtr (Object_ mtbl Hidden)}};
+
+//An example useful object type: Ref a, which supports get and set. That can
+//be used to enclose mutation, allowing algorithms which mutate a given
+//cell to ignore its representation.
+//That could be used to make functions which would otherwise write to pointers
+//of a given region more generic.
+
+data RefTbl a c = {RefTbl {rt_get: MPtr c -> a, rt_set: (MPtr c, a) -> ()}};
+type Ref a = Object (RefTbl a);
+mkRef : (MPtr (RefTbl a c), c) -> Ref a;
+mkRef (tbl,c) :=
+ return coerce (allocValue Object_ {o_mtbl: tbl, o_closed: c});
+
+ref_get : Ref a -> a;
+ref_get ref := {
+ var rt = (ref.unObject)->o_mtbl,
+     closed = &((ref.unObject)->o_closed);
+ return rt->rt_get(closed)
+};
+ref_set : (Ref a, a) -> ();
+ref_set (ref,a) := {
+ var rt = (ref.unObject)->o_mtbl,
+     closed = &((ref.unObject)->o_closed);
+ return (rt->rt_set)(closed,a)
+};
+
+//A trivial Ref class, enclosing a Ptr. To use it, you need to store the tbl
+//somewhere in memory (e.g. in a global), then define a constructor that
+//uses it (see the example in CPPDemo.evmc).
+tbl_PtrRef : () -> RefTbl a (Ptr r a);
+tbl_PtrRef() := return RefTbl {rt_get: rt_get_Ptr, rt_set: rt_set_Ptr};
+rt_get_Ptr : MPtr (Ptr r a) -> a;
+rt_get_Ptr pp := return * * pp;
+rt_set_Ptr : (MPtr (Ptr r a),a) -> ();
+rt_set_Ptr (pp,a) := * * pp = a;
+
+//Thunks are used to implement lazy evaluation; they have a single method,
+//(Thunk a).eval() : a.
+//I'll choose to box their behavior and result to keep the thunk fixed-size;
+//that's less efficient and leads to memory fragmentation, but still
+//demonstrates the principle.
+data Thunk a = {Thunk (MPtr (Thunk_ a))};
+data Thunk_ a = {
+ Unevaluated (OutChan a);
+ Evaluating;
+ Evaluated (MPtr a)
+ };
+evalThunk : Thunk a -> a;
+evalThunk (Thunk thp) := {
+ var oc, pa;
+ case *thp of {
+  Unevaluated oc => {
+   *thp = Evaluating;
+   var a = readChan oc;
+   //Note storing space for the a in the thunk may be preferable to get
+   //better control over allocation.
+   *thp = Evaluated (allocValue a);
+   return a
+   };
+  Evaluating => error "Encountered a cyclical dependency in thunk!";
+  Evaluated pa => return *pa
+  }
+ };
+//Note MPtr c has the same repr as the (MPtr c,()) passed to an OutChan's
+//fptr.
+mkThunk : (MPtr c -> a, c) -> Thunk a;
+mkThunk (f,c) :=
+ return Thunk (allocValue (Unevaluated
+  (mkClosure (coerce f, allocValue c))));
+constThunk : a -> Thunk a;
+constThunk a := return Thunk (allocValue (Evaluated (allocValue a)));
+
+data LazyList a = {LazyList (Thunk (LazyList_ a))};
+data LazyList_ a = {LLNil; LLCons a (LazyList a)};
