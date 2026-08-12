@@ -100,7 +100,6 @@ rangeDMArray (lo,hi) :=
 //1..10, summed two ways with the same function. Not just the same definition,
 //the same instance!
 demoClosure() := {
- rangeList(0,1);
  var f = iterSum,
      xs = rangeList(1,10),
      sum_xs = f (iterList xs),
@@ -121,10 +120,93 @@ demoClosure() := {
 //the stack until a special guardian value was encountered... but that might
 //interact poorly with the optimizer.
 
-//TODO
-//Need an example that can't be implemented as cleanly with closures (InChan,
-//OutChan,Iterator etc). Also worth showing: inheritance.
-demoObject() := {};
+//A similar example to the iterator demo, with an inheritance twist:
+//Two classes: a Freezable LIFO that uses a linked list and a Ref that uses an
+//Array.
+//The method tables are stored in globals, requiring they be monomorphic.
+data FS a = {FS {fs_frozen: Bool, fs_contents: List Memory a}};
+ff_mt : FreezableTbl Word (FS Word);
+memory ff_mt;
+freezableTbl : () -> FreezableTbl Word (FS Word);
+freezableTbl() := return FreezableTbl {
+ ft_super: RefTbl popLL pushLL,
+ ft_freeze: freezeLL
+ };
+popLL : (MPtr (FS a),()) -> a;
+popLL(fsp,()) := {
+ var x, xs;
+ case fsp->fs_contents of {
+  Nil => {};
+  Cons x xs => {
+   if fsp->fs_frozen
+   then {}
+   else fsp->fs_contents = xs
+   end;
+   return x
+   }
+  }
+ };
+pushLL : (MPtr (FS a),a) -> ();
+pushLL(fsp,a) :=
+ if fsp->fs_frozen
+ then {}
+ else fsp->fs_contents = Cons a (fsp->fs_contents)
+ end;
+freezeLL : (MPtr (FS a),()) -> ();
+freezeLL(fsp,()) := fsp->fs_frozen = True;
+freezableLIFO : () -> Object (FreezableTbl Word);
+freezableLIFO() := return mkObject(&ff_mt,FS False Nil);
+//And now for something completely different.
+arr_mt : RefTbl Word (A4S Word);
+memory arr_mt;
+data A4S a = {A4S {a4s_index: Short, a4s_contents: Array 4 a}};
+array4RefTbl : () -> RefTbl a (A4S a);
+array4RefTbl() := return RefTbl{rt_get:array4get,rt_set:array4set};
+array4get : (MPtr (A4S a),()) -> a;
+array4get(a4s,()) := {
+ var ix = a4s->a4s_index,
+     a = (a4s->a4s_contents)!ix;
+ a4s->a4s_index = (ix+1) & 3;
+ return a
+};
+array4set : (MPtr (A4S a), a) -> ();
+array4set(a4s,a) := {
+ var ix = a4s->a4s_index;
+ (a4s->a4s_contents)!ix = a;
+ a4s->a4s_index = (ix+1) & 3
+ };
+array4Buffer : () -> Ref Word;
+array4Buffer() := return mkObject(&arr_mt,null());
+//A contrived function for using a Word ref: sets it to 1..4, then gets 4 times
+//and returns the result.
+useRef : Ref Word -> (Word,Word,Word,Word);
+useRef r := {
+ ref_set(r,1);
+ //revertValue 0xbead00bee;
+ for(var i = 1; i < 5; i++) ref_set(r,i);
+ //revertValue 0x1337;
+ var p = alloc 1;
+ var pw = coerce p :: MPtr Word;
+ for(var i = 1; i < 5; i++) *(pw++) = ref_get r;
+ return *p
+ };
+//A false cond hidden from the optimizer's prying eyes; used for debugging.
+secretlyFalse() := return calldataload(calldatasize());
+demoObject() := {
+ //First init the method tables used.
+ ff_mt = freezableTbl();
+ arr_mt = array4RefTbl();
+ //Create a freezable and a ref
+ var frz = freezableLIFO(),
+     ref = array4Buffer();
+ //Use the ref 
+ var tup1 = useRef ref;
+ //frz is a subclass of ref; we convert it to a Ref to use it.
+ var tup2 = useRef (o_super frz);
+ //In summary, two different classes with two different behaviors can be
+ //used by the same combinators.
+ returnValue(tup1,tup2)
+};
 
 //Laziness lets you decouple the producer and consumer, improving
 //composability (cf 'Why FP matters').

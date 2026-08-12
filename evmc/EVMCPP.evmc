@@ -80,40 +80,136 @@ data Object_ mtbl c = {Object_ {o_mtbl: MPtr (mtbl c), o_closed: c}};
 Object : (Type -> Type) -> Type;
 data Object mtbl = {Object {unObject: MPtr (Object_ mtbl Hidden)}};
 
+mkObject : (MPtr (mt c), c) -> Object mt;
+mkObject(mtp,c) :=
+ return coerce (allocValue Object_ {o_mtbl: mtp, o_closed: c});
+
 //An example useful object type: Ref a, which supports get and set. That can
 //be used to enclose mutation, allowing algorithms which mutate a given
 //cell to ignore its representation.
 //That could be used to make functions which would otherwise write to pointers
 //of a given region more generic.
 
-data RefTbl a c = {RefTbl {rt_get: MPtr c -> a, rt_set: (MPtr c, a) -> ()}};
+data RefTbl a c = {RefTbl {rt_get: (MPtr c,()) -> a,
+                           rt_set: (MPtr c, a) -> ()}};
 type Ref a = Object (RefTbl a);
 mkRef : (MPtr (RefTbl a c), c) -> Ref a;
 mkRef (tbl,c) :=
  return coerce (allocValue Object_ {o_mtbl: tbl, o_closed: c});
 
 ref_get : Ref a -> a;
+ref_get r := return obj_call_method(r,mref_get(),());
+/*
 ref_get ref := {
  var rt = (ref.unObject)->o_mtbl,
      closed = &((ref.unObject)->o_closed);
  return rt->rt_get(closed)
 };
+*/
 ref_set : (Ref a, a) -> ();
-ref_set (ref,a) := {
+ref_set (r,a) := obj_call_method(r,mref_set(),a);
+/*{
  var rt = (ref.unObject)->o_mtbl,
      closed = &((ref.unObject)->o_closed);
  return (rt->rt_set)(closed,a)
-};
+};*/
 
 //A trivial Ref class, enclosing a Ptr. To use it, you need to store the tbl
 //somewhere in memory (e.g. in a global), then define a constructor that
 //uses it (see the example in CPPDemo.evmc).
 tbl_PtrRef : () -> RefTbl a (Ptr r a);
 tbl_PtrRef() := return RefTbl {rt_get: rt_get_Ptr, rt_set: rt_set_Ptr};
-rt_get_Ptr : MPtr (Ptr r a) -> a;
-rt_get_Ptr pp := return * * pp;
+rt_get_Ptr : (MPtr (Ptr r a),()) -> a;
+rt_get_Ptr (pp,()) := return * * pp;
 rt_set_Ptr : (MPtr (Ptr r a),a) -> ();
 rt_set_Ptr (pp,a) := * * pp = a;
+
+//Using the Contract trick:
+//An OMethod is an offset into the method table pointing to an a -> b for any
+//method table (mt c).
+//Note there's no check that the method at the given offset is the right type...
+OMethod : (Type -> Type) -> Type -> Type -> Type;
+data OMethod mt a b = {OMethod Short};
+obj_call_method : (Object mt, OMethod mt a b, a) -> b;
+obj_call_method (o,m,a) := {
+ var moff = add(coerce (o.unObject->o_mtbl), coerce m);
+ return (*(unsafeCoerce moff))(&(o.unObject->o_closed),a)
+ };
+mref_get : () -> OMethod (RefTbl a) () a;
+mref_get() := return OMethod 0;
+mref_set : () -> OMethod (RefTbl a) a ();
+mref_set() := return OMethod 2;
+
+//obj_call_method and first-class methods allows code to be generic in
+//method.
+//A slightly contrived example that calls .m() on every o in a range:
+//Using ptr and bound rather than DMArray to avoid importing MArray.
+map_method : (MPtr (Object m), Short, OMethod m () a) -> ();
+map_method(op,len,m) := {
+ var bound = indexPtr(op,len);
+ while(coerce op < coerce bound)
+  obj_call_method(*(op++),m,())
+};
+
+//Object supports inheritance based on exposed methods: a table T2 that
+//contains T1 as a prefix inherits T1.
+//Since the state type is hidden, two objects with different state but the
+//same API are indistinguishable; inheritance based on state extension is
+//not supported.
+
+//OInherits is a proof of inheritance.
+OInherits : (Type -> Type) -> (Type -> Type) -> Type;
+data OInherits parent child = {};
+oinherits : () -> OInherits mt1 mt2;
+//Base case
+instance oinherits : () -> OInherits mt mt where
+ _ := {};
+//Inheritance is transitive and thus proofs can be composed:
+ovia : (OInherits a b,OInherits b c) -> OInherits a c;
+ovia _ := {};
+//An inheritance hierarchy can be implemented via recursion:
+//Introducing GetTbl a, the only possible nontrivial superclass of RefTbl a:
+data GetTbl a c = {GetTbl {gt_get: MPtr c -> a}};
+instance oinherits : () -> OInherits (GetTbl a) (RefTbl a) where
+ _ := {};
+//Introducing FreezableTbl a, a subclass of RefTbl a:
+data FreezableTbl a c = {
+ FreezableTbl {
+  ft_super: RefTbl a c,
+  ft_freeze: (MPtr c,()) -> ()
+  }
+ };
+//Freezable has two superclasses, so its instance must be recursive:
+instance oinherits : () -> OInherits mt (FreezableTbl a) where
+ _ := return ovia(oinherits(),
+                  null() :: OInherits (RefTbl a) (FreezableTbl a));
+//An Object may be converted to any of its superclasses:
+//o_super and o_sub are automatic, but sometimes the user may want to manually
+//construct a proof - hence o_superclass and o_subclass.
+o_super : Object des -> Object anc;
+o_super o := return o_superclass(oinherits(),o);
+o_superclass : (OInherits anc des, Object des) -> Object anc;
+o_superclass (_,o) := return coerce o;
+//A method of a superclass is also a method for any subclass:
+o_sub : OMethod anc a b -> OMethod des a b;
+o_sub m := return o_subclass(oinherits(),m);
+o_subclass : (OInherits anc des, OMethod anc a b) -> OMethod des a b;
+o_subclass (_,m) := return coerce m;
+
+//get, set and freeze can now be defined on methods on their highest defining
+//class and then converted via o_sub.
+mget_get : () -> OMethod (GetTbl a) () a;
+mget_get() := return OMethod 0;
+//mref_set already defined
+mfreeze : () -> OMethod (FreezableTbl a) () ();
+mfreeze() := return OMethod 4;
+
+//The above approach doesn't directly support multiple inheritance, but it
+//can be implemented by overloading the OMethod on interface type.
+//That requires defining the method as mixin from the start.
+mixin_get : () -> OMethod (m a) () a;
+instance mixin_get : () -> OMethod (RefTbl a) () a where
+ () := return mref_get();
 
 //Thunks are used to implement lazy evaluation; they have a single method,
 //(Thunk a).eval() : a.
