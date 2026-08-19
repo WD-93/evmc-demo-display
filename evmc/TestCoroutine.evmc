@@ -1,0 +1,68 @@
+import Creation;
+constructor():=();
+contract text {
+
+import Prelude;
+import Coroutine;
+
+//A demo of what you can do with coroutines.
+//An actor model implementation would be very interesting, but I'll start
+//with defining both an iterator and its consumer as single functions.
+
+//Coroutine no longer supports yielding values, since it's meant to be a
+//minimal, extensible primitive. Extending it to also yield values:
+//For simplicity, I'll just alloc them and pass the pointer in scratch.
+data CoIter a = {CoIter {unCoIter: Coroutine}};
+data YieldChan a = {YieldChan};
+newCoIter : (Short, (YieldChan a, s) -> (), s) -> CoIter a;
+newCoIter(len,f,s) := return CoIter (newCo(len,f,(YieldChan,s)));
+resumeCoIter : CoIter a -> a;
+resumeCoIter (CoIter co) := {
+ resumeCo co;
+ return *(unsafeCoerce coiScratch)
+ };
+yieldCoIter : (YieldChan a,a) -> ();
+yieldCoIter(_,a) := {
+ coiScratch = coerce (allocValue a);
+ yieldCo()
+ };
+//I need a new scratch global because sub-pointer writes clobber scratch.
+coiScratch : Word;
+memory coiScratch;
+
+//A function that yields the words n..n+9.
+yield10 : (YieldChan Word, Word) -> ();
+yield10(yc,n) :=
+ for(var bound = n+10; n < bound; n++)
+  yieldCoIter(yc,n);
+
+//A simpler test first:
+yield1 : (YieldChan Word,()) -> ();
+yield1(yc,_) := yieldCoIter(yc,0xa11500d);
+
+yield2 : (YieldChan Word, ()) -> ();
+yield2(yc,n) := {
+ yieldCoIter(yc,0xdeadbeef);
+ yieldCoIter(yc,0xbead00bee)
+ };
+
+//The coroutine is being corrupted... need to see what's happening.
+returnCo : Coroutine -> ();
+returnCo co :=
+ evm_return(coerce co, coerce (coerce co + (co.unCo->co_max_words) << 5));
+
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ callable yield10;
+ var coi = newCoIter(20,yield10,coerce (*(null() :: Ptr Calldata Short)));
+ //Return all yielded values as an array:
+ var r = alloc 1 :: MPtr (Array 10 Word);
+ var to = coerce r;
+ while((coi.unCoIter.unCo)->co_status == CoBlocked)
+  *(to++) = resumeCoIter coi;
+ //I actually resume 11 times, so the final allocated value gets clobbered;
+ //fortunately it's ignored.
+ returnPtr r
+ }
+
+}

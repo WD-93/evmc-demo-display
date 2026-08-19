@@ -1,0 +1,104 @@
+//A library for recoverable exceptions using assembly to get around EVMC's
+//structured stack access.
+//Exceptions are simpler than coroutines since they don't need to be resumed;
+//a throw need only unwind the stack until a guardian word is encountered,
+//at which point it returns the exception thrown.
+
+//Exception values are boxed to ensure the same assembly can handle any
+//exception type.
+
+import Asm;
+
+//API:
+//Problem: since they don't just return coerced assembly pointers, throw and
+//catch will include return continuations. TODO TCO them.
+
+//Throws an exception. If there is no corresponding catch, the CALL will
+//revert.
+//Takes a ThrowHandle to ensure the exceptional code throws an exception of
+//the same type that the catch expects? No, just make sure you throw the
+//expected type.
+//FW: effect types for EVMC functions?
+throw : err -> ();
+throw err := {
+ //This avoids keeping the error on the stack during unwinding.
+ errPtr = coerce (allocValue err);
+ (coerce (&throwAsm) :: () -> ())()
+};
+
+//Runs f with initial argument a, catching any exception thrown. Returns an
+//Either rather than pass two continuations; uses pointers to ensure the
+//same assembly can handle any catch instantiation.
+catch : (MPtr a, MPtr a -> MPtr b) ->
+        Either (MPtr err) (MPtr b);
+catch x := return coerce (&catchAsm) x;
+
+//Implementation:
+
+//A proxy value, used only to communicate error type.
+//data ThrowHandle err = {};
+
+/*
+TODO ensure that's what the stack actually looks like post-opt!
+
+Catch assembly:
+stk: pa,f,$ret
+target stk: f,pa,success,"catch!",$ret
+
+success:
+stk: pb,"catch!",$ret
+jump $ret (Right pb)
+
+*/
+code catchAsm = Struct (
+ JUMPDEST,
+ PushPtr (&successAsm),
+ SWAP1,
+ Push6 (coerce "catch!"),
+ SWAP3,
+ //stk: f,pa,success,"catch!",$ret
+ //Call f:
+ JUMP
+ );
+code successAsm = Struct (
+ JUMPDEST,
+ //stk: pb,"catch!",$ret
+ //pb => Right pb:
+ Push3 0x010000,
+ OR,
+ //jump $ret (Right pb)
+ SWAP1,
+ POP,
+ SWAP1,
+ JUMP
+ );
+
+/*
+Throw assembly:
+stk: $ret,x
+Note $ret is guaranteed not to be "catch!"
+dowhile (ToS != "catch!"):
+ pop
+stk: $ret
+jump $ret (Left (*errPtr))
+
+*/
+code throwAsm = Struct (
+ JUMPDEST,
+ Push6 (coerce "catch!"),
+ XOR,
+ Push2 (coerce (&throwAsm)),
+ JUMPI,
+ //p = Left (*errPtr)
+ PushPtr (&errPtr),
+ MLOAD,
+ Push1 240, SHR,
+ //Left is zero-cost since the tag is 0
+ //jump $ret p
+ SWAP1, JUMP
+ );
+
+//A place to store a pointer to the error. There's no contention for it since
+//only one error can be thrown at a time.
+errPtr : MPtr ();
+memory errPtr;

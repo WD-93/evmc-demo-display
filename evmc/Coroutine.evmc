@@ -1,0 +1,238 @@
+//A library for transparent coroutines.
+//A coroutine is a computation that can yield and be resumed.
+//JavaScript implements them via async/await, which distinguishes synchronous
+//and asynchronous functions. Beyond adding syntactic overhead, that makes
+//it impossible to call blocking code from non-blocking higher-order functions
+//due to asynchronous functions being semantically different.
+//In contrast, transparent coroutines allow one to write blocking code as
+//ordinary functions compatible with existing combinators.
+//Coroutines also allow both the producer and consumer of some data to be
+//written as single functions, which could be very useful for defining
+//iterators.
+
+//The EVM is not ideal for coroutine implementation, since the stack lives in
+//a separate region from memory. That means yield/resume requires flushing
+//the stack to memory and restoring it respectively, both relatively expensive
+//operations.
+//However, for the right use case the reduced implementation complexity
+//coroutines enable may be worth the cost.
+
+import Asm;
+
+//API:
+
+//Simplification: Coroutine no longer passes a value on resume or yield, nor
+//does it record the function's return value. Those require either:
+//1) allocation, which has a runtime cost and would benefit from custom logic
+//to enable reuse,
+//2) or passing a pointer, which also has a runtime cost and makes using the
+//   abstraction less clean.
+//Coroutine should be a minimal, extensible primitive; additional custom
+//features can be built on top of it.
+
+//Allocates a new coroutine with space for max_words words.
+//It runs function f, which takes a YieldChan a b (to ensure it yields pointers
+//of the right type and interprets the pointers it receives as the right
+//type) and an initial argument. Since it must be resumed to start running,
+//it also takes the first MPtr a it receives.
+//Coroutines communicate via pointers to ensure the values yielded, received
+//and returned all take the same number of words on the stack (1), enabling the
+//same assembly primitives to handle all coroutine types.
+//Assembly is required because yield and resume violate EVMC's structured
+//stack access assumptions.
+newCo : (Short, s -> (), s) -> Coroutine;
+
+//Resumes a coroutine, restoring its contents to the stack.
+//Reverts if the coroutine is not blocked; reentry is prohibited.
+resumeCo : Coroutine -> ();
+
+//Run a coroutine to completion.
+runCo : Coroutine -> ();
+runCo co :=
+ while ((co.unCo)->co_status != CoDone)
+  resumeCo co;
+
+//Yield a value from a coroutine, halting its execution.
+//Receives a MPtr a from its next caller when resumed.
+yieldCo : () -> ();
+
+//A coroutine is either blocked, running, or done.
+//I don't represent dead (uncaught exception thrown); whether to do so and
+//thus entangle coroutines with Exceptions is a nontrivial choice.
+data CoStatus = {CoBlocked;CoRunning;CoDone};
+
+//A coroutine is a boxed in-memory data structure consisting of:
+data Coroutine = {Co {unCo: MPtr Coroutine_}}; 
+data Coroutine_ = {Co_ {
+  co_status: CoStatus, //indicates whether coroutine is blocked, running or done
+  co_max_words: Short, //maximum number of words allocated for stack
+  co_bottom: MPtr Word,//points to the bottom of the stack
+  }
+ };
+//Persisted stack layout: the PC (i.e. the $ret of the yield call) is at
+//the lowest address, immediately after bottom.
+//Stack words are then stored in ascending order, with the top of the stack
+//at the next index.
+//The stack is restored in the reverse order, starting from co_bottom.
+
+//As of now, the compiler is unaware functions passed to badfuns may be called.
+secretlyFalse:()->Word;
+secretlyFalse():= return calldataload(calldatasize());
+//callable signals to the optimizer that the given function
+//1) must be placed,
+//2) may be called with arbitrary constant arguments,
+//3) has its return value used...
+//4) must be called twice to prevent fusing into the then branch!
+//with minimal runtime impact.
+//The result is written to storage in the never-taken branch to ensure its
+//result is not discarded unless main is guaranteed to revert.
+//That's not ideal, since reverting is a perfectly valid way to return a
+//value if you have no side effects.
+//This is a hack; TODO add a @callable f : T pragma to avoid any runtime impact.
+callable : (a -> b) -> ();
+callable f :=
+ if secretlyFalse()
+ then {
+ *(null() :: Ptr Storage b) = f (*(null() :: Ptr Calldata a));
+ *(null() :: Ptr Storage b) = f (*(null() :: Ptr Calldata a))
+ }
+ else {}
+ end;
+
+//Initial stack layout on creation: the lowest index holds the sentinel word,.
+//which is followed by (f,s).
+//Note s may be multiple words.
+newCo (len,f,s) := {
+ var coSz = sizeof (P :: P Coroutine_),
+     //Allocate total size including the stack
+     p = alloc (coSz + len << 5) :: MPtr Byte,
+     cop = coerce p,
+     sp = coerce (inc cop);
+ *sp = ("resume!",f,s,&coReturn);
+ *cop = Co_ {
+   co_status: CoBlocked,
+   co_max_words: len,
+   //Points to coReturn, which is always the bottom of the coroutine stack.
+   co_bottom: unsafeCoerce (coerce (inc sp) - 32)
+  };
+ return Co cop
+};
+
+//The currently executing coroutine is stored in a global, co_self.
+//That's necessary in order to know where to flush to.
+//null indicates no coroutine.
+co_self : Coroutine;
+memory co_self;
+
+//If running or done, revert with an error message.
+//If blocked, call into resumeAsm.
+//Resume returns when the coroutine yields, at which point you can compare
+//the final word pointer to the maximum space available; revert if too much
+//space was used.
+resumeCo co := {
+ //Read aggregation:
+ var co_ = *(co.unCo);
+ if co_.co_status == CoBlocked
+ then {
+  (co.unCo)->co_status = CoRunning;
+  //Save self:
+  var self = co_self;
+  co_self = coerce co;
+  var last = (coerce (&resumeAsm))(co_.co_bottom) :: Short;
+  if last > (coerce (inc (co.unCo)) + co_.co_max_words << 5)
+  then revertValue "Stack overflow!"
+  else {}
+  end;
+  (co.unCo)->co_bottom = coerce (last - 32);
+  co_self = self
+ }
+ else revertValue "Bad resume!"
+ end
+};
+
+//resumeAsm(bot,$ret) restores words from bottom until the sentinel value is
+//encountered. Since resume and catch use different sentinels, it should be
+//possible to use them together.
+//First resume must place the on-stack sentinel...
+//Resulting layout: f,w1,w2,w3...&coReturn
+//f is a continuation that expects ().
+
+code resumeAsm = Struct (
+ JUMPDEST,
+ //Loop; stk = bot,s*
+ //loop {
+ // x = *bot
+ // push x to s
+ // bot -= 32
+ // if x != "resume!":
+ //  continue
+ // }
+ DUP1, MLOAD,
+ SWAP1,
+ Push1 32, SWAP1, SUB,
+ DUP2, Push7 (coerce "resume!"), XOR,
+ Push2 (coerce (&resumeAsm)),
+ JUMPI,
+ //stk: bot,"resume!",f,w1,w2,...&coReturn
+ POP, POP,
+ //stk: f,w1,w2,...&coReturn
+ JUMP
+ );
+
+//Ah: the bottom of the coroutine's stack should be the final return
+//continuation, which can also serve as a sentinel when yielding.
+//You need one stack sentinel for yielding and a memory sentinel for resuming.
+//The final return continuation should write the MPtr r to
+//co_self's co_returned, then return 0 to resumeAsm. Since that's
+//guaranteed to be lower than the maximum persisted stack pointer, resumeCo
+//will not revert.
+code coReturn = Struct (
+ JUMPDEST,
+ //co_self->co_status = CoDone
+ PushPtr (&co_self),
+ MLOAD,
+ //co_status is in the top 16b
+ //Zeroing them:
+ Push1 16, SHL, Push1 16, SHR,
+ //Setting them:
+ //Being able to use constructors in asm is convenient...
+ Push1 (coerce CoDone),
+ Push1 240, SHL, OR,
+ //Writing back:
+ PushPtr (&co_self),
+ MSTORE,
+ //stk: $ret
+ //Returning 0:
+ Push0, SWAP1, JUMP
+ );
+
+yieldCo() := {
+ var cop = co_self.unCo;
+ cop->co_status = CoBlocked;
+ var start = coerce (inc cop);
+ //Can't forget to place the sentinel!
+ //It should not be necessary to reset it... just don't clobber it.
+ //TODO include the sentinel in the Coroutine_ header to avoid 32+_.
+ //mstore(start,coerce "resume!");
+ return (coerce (&yieldAsm))(32+start);
+ };
+
+//stk: top,...,coReturn,$ret
+//top is a word pointer; its final value will be returned to $ret.
+code yieldAsm = Struct (
+ JUMPDEST,
+ //stk: top,x,...
+ //loop {
+ // *top = x
+ // top += 32
+ // if x != coReturn:
+ //  continue
+ // }
+ DUP2, DUP2, MSTORE,
+ Push1 32, ADD,
+ SWAP1, Push2 (coerce (&coReturn)), XOR,
+ Push2 (coerce (&yieldAsm)),
+ JUMPI,
+ //stk: top,$ret
+ SWAP1, JUMP
+ )

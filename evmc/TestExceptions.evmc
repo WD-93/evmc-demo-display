@@ -1,0 +1,61 @@
+import Creation;
+constructor():=();
+contract text {
+ import Prelude;
+ import Exceptions;
+
+ data DivideByZero = {DivideByZero};
+ tag DivideByZero = Short where {DivideByZero: 0xdead};
+ //Throws a DivideByZero if divisor is 0
+ exDiv : (Int s l, Int s l) -> Int s l;
+ exDiv(a,b) :=
+  if b
+  then return a / b
+  else throw DivideByZero
+  end;
+
+ divArr : MPtr (Short, Ptr Calldata Byte) -> MPtr Short;
+ divArr plenp := {
+  var len, p;
+  (len,p) = *plenp;
+  for(var i = 0; i < len; i++)
+   exDiv(100,p[i]);
+  return allocValue 0x1337
+ };
+ simpleThrow : MPtr () -> MPtr ();
+ simpleThrow _ := throw DivideByZero;
+
+ //The compiler is unaware functions passed to badfuns may be called.
+ //Ensuring simpleThrow is considered potentially called using a secretly
+ //false condition.
+ secretlyFalse:()->Word;
+ secretlyFalse():= return calldataload(calldatasize());
+
+ //Map (100 / _) over a given array in calldata, catching any DivideByZero
+ //exception.
+ main():= {
+  memAllocPtr = coerce (&memOffset);
+  if secretlyFalse()
+  then {//simpleThrow(null());
+        //It's not enough to have just one call, then it gets fused to its
+	//call site...
+	//simpleThrow(null())
+	//Passing null to both calls causes it to be specialized...
+	divArr(unsafeCoerce (calldataload 0x42));
+	//Gotta use the result to avoid it being replaced with 0...?
+	var x = divArr(null()); mstore(0,coerce x)
+       }
+  else {}
+  end;
+  var len = *(null() :: Ptr Calldata Short);
+  var errp, goodp;
+  case //catch (unsafeCoerce 0xbeef,simpleThrow)
+   catch (allocValue (len,coerce 2 :: Ptr Calldata Byte), divArr)
+  of {
+   Left errp => returnPtr (errp :: MPtr DivideByZero);
+   Right goodp => returnPtr (goodp :: MPtr Short)
+  }
+ };
+ //I really don't have Either in Prelude?
+ data Either a b = {Left a; Right b}
+}

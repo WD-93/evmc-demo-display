@@ -1,0 +1,427 @@
+//EVMC has no inline assembly due to the difficulties it could potentially
+//pose for the optimizer and Core IR.
+//Structured control flow with locals on the stack is well-suited for most EVM
+//use cases, but not all of them; in particular, automata which push or pop
+//a variable number of words cannot be implemented directly in EVMC.
+//Transparent closures are a particularly compelling use case for such
+//automata, so I'll do my best to get something like assembly using EVMC's
+//existing features.
+
+//Design:
+//Assembly sections can be placed in code using code globals; as long as
+//they're all well-formed bytecode (i.e. none contain a PUSH* that consumes
+//bytes off the end), they should be executable.
+//Structs can be used to tag basic blocks with labels.
+//For that I need to serialize &(codeG.field), requiring static eval of
+//&_ and *_.
+//Oh no: consider a single-BB while loop.
+//code codeG = Struct(Jumpdest,...,PushPtr (&codeG), Jumpi).
+//That forms an SCC; can HM handle that? Worse, datatypes can't hide the type
+//params of their arguments because I don't have existentials.
+//Solution: support serialization of coerce e.
+//Need to be careful to ensure supported compile-time eval remains consistent
+//with runtime behavior, modulo Code allocValue.
+//Instructions translate to mnemonic datatypes which have the opcode as their
+//tag.
+
+//A datatype of EVM opcodes, not including immediate arguments.
+//Algo: intercalate ";\n " uppercase mnemonics in ascending order of opcode.
+//GHCI in compiler repo:
+//:l OpcodeInfo
+//import Data.Char
+//import Data.List (sort,intercalate)
+//op_mnems = sort $ map (\(mnem,op)->(op, map toUpper mnem)) $
+//           M.toList $ M.map oiOpcode opcodes
+//writeFile "toCopy.txt" $ intercalate ";\n" [" "++mnem | (_,mnem) <- op_mnems]
+data EVM = {
+ STOP;
+ ADD;
+ MUL;
+ SUB;
+ DIV;
+ SDIV;
+ MOD;
+ SMOD;
+ ADDMOD;
+ MULMOD;
+ EXP;
+ SIGNEXTEND;
+ LT;
+ GT;
+ SLT;
+ SGT;
+ EQ;
+ ISZERO;
+ AND;
+ OR;
+ XOR;
+ NOT;
+ BYTE;
+ SHL;
+ SHR;
+ SAR;
+ KECCAK256;
+ ADDRESS;
+ BALANCE;
+ ORIGIN;
+ CALLER;
+ CALLVALUE;
+ CALLDATALOAD;
+ CALLDATASIZE;
+ CALLDATACOPY;
+ CODESIZE;
+ CODECOPY;
+ GASPRICE;
+ EXTCODESIZE;
+ EXTCODECOPY;
+ RETURNDATASIZE;
+ RETURNDATACOPY;
+ EXTCODEHASH;
+ BLOCKHASH;
+ COINBASE;
+ TIMESTAMP;
+ NUMBER;
+ PREVRANDAO;
+ GASLIMIT;
+ CHAINID;
+ SELFBALANCE;
+ BASEFEE;
+ BLOBHASH;
+ BLOBBASEFEE;
+ POP;
+ MLOAD;
+ MSTORE;
+ MSTORE8;
+ SLOAD;
+ SSTORE;
+ JUMP;
+ JUMPI;
+ PC;
+ MSIZE;
+ GAS;
+ JUMPDEST;
+ TLOAD;
+ TSTORE;
+ MCOPY;
+ PUSH0;
+ PUSH1;
+ PUSH2;
+ PUSH3;
+ PUSH4;
+ PUSH5;
+ PUSH6;
+ PUSH7;
+ PUSH8;
+ PUSH9;
+ PUSH10;
+ PUSH11;
+ PUSH12;
+ PUSH13;
+ PUSH14;
+ PUSH15;
+ PUSH16;
+ PUSH17;
+ PUSH18;
+ PUSH19;
+ PUSH20;
+ PUSH21;
+ PUSH22;
+ PUSH23;
+ PUSH24;
+ PUSH25;
+ PUSH26;
+ PUSH27;
+ PUSH28;
+ PUSH29;
+ PUSH30;
+ PUSH31;
+ PUSH32;
+ DUP1;
+ DUP2;
+ DUP3;
+ DUP4;
+ DUP5;
+ DUP6;
+ DUP7;
+ DUP8;
+ DUP9;
+ DUP10;
+ DUP11;
+ DUP12;
+ DUP13;
+ DUP14;
+ DUP15;
+ DUP16;
+ SWAP1;
+ SWAP2;
+ SWAP3;
+ SWAP4;
+ SWAP5;
+ SWAP6;
+ SWAP7;
+ SWAP8;
+ SWAP9;
+ SWAP10;
+ SWAP11;
+ SWAP12;
+ SWAP13;
+ SWAP14;
+ SWAP15;
+ SWAP16;
+ LOG0;
+ LOG1;
+ LOG2;
+ LOG3;
+ LOG4;
+ CREATE;
+ CALL;
+ CALLCODE;
+ RETURN;
+ DELEGATECALL;
+ CREATE2;
+ STATICCALL;
+ REVERT;
+ INVALID;
+ SELFDESTRUCT
+};
+//Algo: intercalate ",\n " mnemonic ": " opcode (TODO in hex)
+//Using op_mnems defined earlier:
+//writeFile "toCopy.txt" $ intercalate ",\n"
+// [" "++mnem++": "++show op | (op,mnem) <- op_mnems]
+tag EVM = Byte where {
+ STOP: 0,
+ ADD: 1,
+ MUL: 2,
+ SUB: 3,
+ DIV: 4,
+ SDIV: 5,
+ MOD: 6,
+ SMOD: 7,
+ ADDMOD: 8,
+ MULMOD: 9,
+ EXP: 10,
+ SIGNEXTEND: 11,
+ LT: 16,
+ GT: 17,
+ SLT: 18,
+ SGT: 19,
+ EQ: 20,
+ ISZERO: 21,
+ AND: 22,
+ OR: 23,
+ XOR: 24,
+ NOT: 25,
+ BYTE: 26,
+ SHL: 27,
+ SHR: 28,
+ SAR: 29,
+ KECCAK256: 32,
+ ADDRESS: 48,
+ BALANCE: 49,
+ ORIGIN: 50,
+ CALLER: 51,
+ CALLVALUE: 52,
+ CALLDATALOAD: 53,
+ CALLDATASIZE: 54,
+ CALLDATACOPY: 55,
+ CODESIZE: 56,
+ CODECOPY: 57,
+ GASPRICE: 58,
+ EXTCODESIZE: 59,
+ EXTCODECOPY: 60,
+ RETURNDATASIZE: 61,
+ RETURNDATACOPY: 62,
+ EXTCODEHASH: 63,
+ BLOCKHASH: 64,
+ COINBASE: 65,
+ TIMESTAMP: 66,
+ NUMBER: 67,
+ PREVRANDAO: 68,
+ GASLIMIT: 69,
+ CHAINID: 70,
+ SELFBALANCE: 71,
+ BASEFEE: 72,
+ BLOBHASH: 73,
+ BLOBBASEFEE: 74,
+ POP: 80,
+ MLOAD: 81,
+ MSTORE: 82,
+ MSTORE8: 83,
+ SLOAD: 84,
+ SSTORE: 85,
+ JUMP: 86,
+ JUMPI: 87,
+ PC: 88,
+ MSIZE: 89,
+ GAS: 90,
+ JUMPDEST: 91,
+ TLOAD: 92,
+ TSTORE: 93,
+ MCOPY: 94,
+ PUSH0: 95,
+ PUSH1: 96,
+ PUSH2: 97,
+ PUSH3: 98,
+ PUSH4: 99,
+ PUSH5: 100,
+ PUSH6: 101,
+ PUSH7: 102,
+ PUSH8: 103,
+ PUSH9: 104,
+ PUSH10: 105,
+ PUSH11: 106,
+ PUSH12: 107,
+ PUSH13: 108,
+ PUSH14: 109,
+ PUSH15: 110,
+ PUSH16: 111,
+ PUSH17: 112,
+ PUSH18: 113,
+ PUSH19: 114,
+ PUSH20: 115,
+ PUSH21: 116,
+ PUSH22: 117,
+ PUSH23: 118,
+ PUSH24: 119,
+ PUSH25: 120,
+ PUSH26: 121,
+ PUSH27: 122,
+ PUSH28: 123,
+ PUSH29: 124,
+ PUSH30: 125,
+ PUSH31: 126,
+ PUSH32: 127,
+ DUP1: 128,
+ DUP2: 129,
+ DUP3: 130,
+ DUP4: 131,
+ DUP5: 132,
+ DUP6: 133,
+ DUP7: 134,
+ DUP8: 135,
+ DUP9: 136,
+ DUP10: 137,
+ DUP11: 138,
+ DUP12: 139,
+ DUP13: 140,
+ DUP14: 141,
+ DUP15: 142,
+ DUP16: 143,
+ SWAP1: 144,
+ SWAP2: 145,
+ SWAP3: 146,
+ SWAP4: 147,
+ SWAP5: 148,
+ SWAP6: 149,
+ SWAP7: 150,
+ SWAP8: 151,
+ SWAP9: 152,
+ SWAP10: 153,
+ SWAP11: 154,
+ SWAP12: 155,
+ SWAP13: 156,
+ SWAP14: 157,
+ SWAP15: 158,
+ SWAP16: 159,
+ LOG0: 160,
+ LOG1: 161,
+ LOG2: 162,
+ LOG3: 163,
+ LOG4: 164,
+ CREATE: 240,
+ CALL: 241,
+ CALLCODE: 242,
+ RETURN: 243,
+ DELEGATECALL: 244,
+ CREATE2: 245,
+ STATICCALL: 250,
+ REVERT: 253,
+ INVALID: 254,
+ SELFDESTRUCT: 255
+};
+
+//Need 33 PUSH* variants, one for each byte length.
+//That's because I don't have compile-time evaluation of constexprs; otherwise
+//I could have tag Push n = Byte where {Push: op_push0 + knownNat (PN :: PN n)}.
+//Autogen to the rescue!
+//TODO write an autogen lib.
+data Push0 = {Push0};
+tag Push0 = EVM where {Push0: PUSH0};
+//Algo:
+//data Push<n> = {Push<n> (UInt <n>)};
+//tag Push<n> = EVM where {Push<n>: PUSH<n>};\n
+//In GHCI:
+//dat n=let s=show n in concat["data Push",s," = {Push",s," (UInt ",s,")};\n"]
+//writeFile "toCopy.txt" $ concat $ map dat [1..32]
+data Push1 = {Push1 (UInt 1)};
+data Push2 = {Push2 (UInt 2)};
+data Push3 = {Push3 (UInt 3)};
+data Push4 = {Push4 (UInt 4)};
+data Push5 = {Push5 (UInt 5)};
+data Push6 = {Push6 (UInt 6)};
+data Push7 = {Push7 (UInt 7)};
+data Push8 = {Push8 (UInt 8)};
+data Push9 = {Push9 (UInt 9)};
+data Push10 = {Push10 (UInt 10)};
+data Push11 = {Push11 (UInt 11)};
+data Push12 = {Push12 (UInt 12)};
+data Push13 = {Push13 (UInt 13)};
+data Push14 = {Push14 (UInt 14)};
+data Push15 = {Push15 (UInt 15)};
+data Push16 = {Push16 (UInt 16)};
+data Push17 = {Push17 (UInt 17)};
+data Push18 = {Push18 (UInt 18)};
+data Push19 = {Push19 (UInt 19)};
+data Push20 = {Push20 (UInt 20)};
+data Push21 = {Push21 (UInt 21)};
+data Push22 = {Push22 (UInt 22)};
+data Push23 = {Push23 (UInt 23)};
+data Push24 = {Push24 (UInt 24)};
+data Push25 = {Push25 (UInt 25)};
+data Push26 = {Push26 (UInt 26)};
+data Push27 = {Push27 (UInt 27)};
+data Push28 = {Push28 (UInt 28)};
+data Push29 = {Push29 (UInt 29)};
+data Push30 = {Push30 (UInt 30)};
+data Push31 = {Push31 (UInt 31)};
+data Push32 = {Push32 (UInt 32)};
+//tag n=let s=show n in concat["tag Push",s," = EVM where {Push",s,": PUSH",s,"};\n"]
+//writeFile "toCopy.txt" $ concat $ map tag [1..32]
+tag Push1 = EVM where {Push1: PUSH1};
+tag Push2 = EVM where {Push2: PUSH2};
+tag Push3 = EVM where {Push3: PUSH3};
+tag Push4 = EVM where {Push4: PUSH4};
+tag Push5 = EVM where {Push5: PUSH5};
+tag Push6 = EVM where {Push6: PUSH6};
+tag Push7 = EVM where {Push7: PUSH7};
+tag Push8 = EVM where {Push8: PUSH8};
+tag Push9 = EVM where {Push9: PUSH9};
+tag Push10 = EVM where {Push10: PUSH10};
+tag Push11 = EVM where {Push11: PUSH11};
+tag Push12 = EVM where {Push12: PUSH12};
+tag Push13 = EVM where {Push13: PUSH13};
+tag Push14 = EVM where {Push14: PUSH14};
+tag Push15 = EVM where {Push15: PUSH15};
+tag Push16 = EVM where {Push16: PUSH16};
+tag Push17 = EVM where {Push17: PUSH17};
+tag Push18 = EVM where {Push18: PUSH18};
+tag Push19 = EVM where {Push19: PUSH19};
+tag Push20 = EVM where {Push20: PUSH20};
+tag Push21 = EVM where {Push21: PUSH21};
+tag Push22 = EVM where {Push22: PUSH22};
+tag Push23 = EVM where {Push23: PUSH23};
+tag Push24 = EVM where {Push24: PUSH24};
+tag Push25 = EVM where {Push25: PUSH25};
+tag Push26 = EVM where {Push26: PUSH26};
+tag Push27 = EVM where {Push27: PUSH27};
+tag Push28 = EVM where {Push28: PUSH28};
+tag Push29 = EVM where {Push29: PUSH29};
+tag Push30 = EVM where {Push30: PUSH30};
+tag Push31 = EVM where {Push31: PUSH31};
+tag Push32 = EVM where {Push32: PUSH32};
+//Push2 variants for Ptr and Fun:
+PushPtr : Region -> Type -> Type;
+data PushPtr r a = {PushPtr (Ptr r a)};
+tag PushPtr r a = EVM where {PushPtr: PUSH2};
+data PushFun a b = {PushFun (a -> b)};
+tag PushFun a b = EVM where {PushFun: PUSH2};
