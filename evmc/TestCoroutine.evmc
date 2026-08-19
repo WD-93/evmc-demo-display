@@ -49,7 +49,8 @@ yield2(yc,n) := {
 //The coroutine is being corrupted... need to see what's happening.
 returnCo : Coroutine -> ();
 returnCo co :=
- evm_return(coerce co, coerce (coerce co + (co.unCo->co_max_words) << 5));
+ evm_return(coerce co, coerce
+            (sizeof (P :: P Coroutine_) + (co.unCo->co_max_words) << 5));
 
 main() := {
  memAllocPtr = coerce (&memOffset);

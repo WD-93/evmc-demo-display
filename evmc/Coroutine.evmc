@@ -67,7 +67,12 @@ data Coroutine_ = {Co_ {
   co_status: CoStatus, //indicates whether coroutine is blocked, running or done
   co_max_words: Short, //maximum number of words allocated for stack
   co_bottom: MPtr Word,//points to the bottom of the stack
+  co_sentinel: ResumeSentinel //The in-memory sentinel, not part of the stack.
   }
+ };
+data ResumeSentinel = {ResumeSentinel};
+tag ResumeSentinel = WordPad (Array 7 Byte) where {
+ ResumeSentinel: WordPad "resume!"
  };
 //Persisted stack layout: the PC (i.e. the $ret of the yield call) is at
 //the lowest address, immediately after bottom.
@@ -108,12 +113,13 @@ newCo (len,f,s) := {
      p = alloc (coSz + len << 5) :: MPtr Byte,
      cop = coerce p,
      sp = coerce (inc cop);
- *sp = ("resume!",f,s,&coReturn);
+ *sp = (f,s,&coReturn);
  *cop = Co_ {
    co_status: CoBlocked,
    co_max_words: len,
    //Points to coReturn, which is always the bottom of the coroutine stack.
-   co_bottom: unsafeCoerce (coerce (inc sp) - 32)
+   co_bottom: unsafeCoerce (coerce (inc sp) - 32),
+   co_sentinel: ResumeSentinel
   };
  return Co cop
 };
@@ -164,16 +170,16 @@ code resumeAsm = Struct (
  // x = *bot
  // push x to s
  // bot -= 32
- // if x != "resume!":
+ // if x != ResumeSentinel:
  //  continue
  // }
  DUP1, MLOAD,
  SWAP1,
  Push1 32, SWAP1, SUB,
- DUP2, Push7 (coerce "resume!"), XOR,
+ DUP2, Push7 (coerce ResumeSentinel), XOR,
  Push2 (coerce (&resumeAsm)),
  JUMPI,
- //stk: bot,"resume!",f,w1,w2,...&coReturn
+ //stk: bot,ResumeSentinel,f,w1,w2,...&coReturn
  POP, POP,
  //stk: f,w1,w2,...&coReturn
  JUMP
@@ -201,12 +207,7 @@ code coReturn = Struct (
 yieldCo() := {
  var cop = co_self.unCo;
  cop->co_status = CoBlocked;
- var start = coerce (inc cop);
- //Can't forget to place the sentinel!
- //It should not be necessary to reset it... just don't clobber it.
- //TODO include the sentinel in the Coroutine_ header to avoid 32+_.
- //mstore(start,coerce "resume!");
- return (coerce (&yieldAsm))(32+start);
+ return (coerce (&yieldAsm))(inc cop);
  };
 
 //stk: top,...,coReturn,$ret
