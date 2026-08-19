@@ -188,19 +188,11 @@ code resumeAsm = Struct (
 //will not revert.
 code coReturn = Struct (
  JUMPDEST,
- //co_self->co_status = CoDone
- PushPtr (&co_self),
- MLOAD,
- //co_status is in the top 16b
- //Zeroing them:
- Push1 16, SHL, Push1 16, SHR,
- //Setting them:
- //Being able to use constructors in asm is convenient...
+ //co_self.unCo->co_status = CoDone
  Push1 (coerce CoDone),
- Push1 240, SHL, OR,
- //Writing back:
  PushPtr (&co_self),
- MSTORE,
+ MLOAD, Push1 240, SHR,
+ MSTORE8,
  //stk: $ret
  //Returning 0:
  Push0, SWAP1, JUMP
