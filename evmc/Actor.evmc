@@ -1,0 +1,339 @@
+//The most natural thing to do with coroutines and exceptions is an actor
+//model!
+//I'll start with no exception handling for now.
+
+import Coroutine;
+
+//Why would you want concurrency on the sequential EVM?
+//Pro:
+//It allows processes to hand off tasks without determining the order in which
+//they're performed.
+//The scheduler simplifies use of coroutines since they don't need to choose
+//which coroutine to run next.
+//In a high-level interpreter, actors could be used to isolate the code of
+//different users. You could e.g. accumulate calls to an external DEX and
+//have a process with a lower priority that makes the call.
+//Con:
+//OTOH, a dedicated interpreter and runtime would be
+//suitable there...
+//Efficiency can be improved by hinting... control flow that's fixed at
+//transaction creation could reduce gas usage and enable new abstractions by
+//moving compute off chain.
+//It's extravagantly expensive if you're context-switching enough that
+//a fixed scheduler isn't enough.
+
+//The abstractions so far have been genuinely promising for enabling more
+//complex contracts in the right situation... an actor model might just be
+//cute. But hey, why not build it anyway?
+
+//Before supporting message passing, let's just support concurrency.
+//With a runQueue, multiple coroutines can await the same event; they don't
+//all need to be run at once when it occurs.
+
+//A Pid is a coroutine that's only resumed via the scheduler.
+//It has a right field in order to link it into queues FIFO; if it's not in
+//a queue then right is null.
+//Its coroutine is stored unboxed.
+data Pid = {Pid {unPid: MPtr Pid_}};
+data Pid_ = {Pid_ {
+ pid_right: Pid,
+ pid_co: Coroutine_
+ }};
+pid2co : Pid -> Coroutine;
+pid2co pid := return Co (&((pid.unPid)->pid_co));
+
+//len is the maximum stack height of the yielded pid.
+spawn : (Short, a -> (), a) -> Pid;
+spawn(len,f,a) := {
+ //Alloc space for right
+ var p = alloc 1 :: MPtr Pid;
+ newCo(len,f,a);
+ var pid = coerce p;
+ liven pid;
+ return pid
+ };
+
+//Adds a Pid to the scheduler's RunQueue
+liven pid := append_rq(&runQueue,pid);
+
+//Since Pids can be strung together, the runQueue can use Pids directly to
+//implement a doubly linked list.
+//A singly linked list with accessible last would be enough to append Pids
+//to the queue and then take one or all of them in FIFO order.
+//DLL is only necessary if you want to remove a Pid from its queue in O(1).
+runQueue : RunQueue;
+memory runQueue;
+//If RQ is empty then it's null.
+//If it has only one element then head == last.
+//Invariant: a Pid is in at most one queue at once.
+data RunQueue = {RQ {rq_head: Pid, rq_last: Pid}};
+
+//Each event has its own RunQueue...
+append_rq : (MPtr RunQueue,Pid) -> ();
+append_rq (rqp,pid) := {
+ var rq = *rqp;
+ //The most common case:
+ if rq
+ then {
+  (rq.rq_last).unPid->pid_right = pid;
+  rq.rq_last = pid
+ }
+ else {
+  rq = RQ pid pid
+ }
+ end;
+ *rqp = rq
+ };
+pop_rq : MPtr RunQueue -> Maybe Pid;
+pop_rq rqp := {
+ var rq = *rqp;
+ if rq
+ then {
+  var h = rq.rq_head;
+  if h == rq.rq_last
+  then rq = null()
+  else rq.rq_head = (h.unPid)->pid_right
+  end;
+  *rqp = rq;
+  (h.unPid)->pid_right = null();
+  return Just h
+ }
+ else return Nothing
+ end
+ };
+
+//Some events may liven all of their waiting pids. In that case you can
+//add all of them to the runQueue in O(1)!
+//Also empties the source q.
+transferAll_rq : (MPtr RunQueue, MPtr RunQueue) -> ();
+transferAll_rq(dstp,srcp) := {
+ var dst = *dstp, src = *srcp;
+ if dst
+ then {
+  if src
+  then {
+   (dst.rq_last.unPid)->pid_right = src.rq_head;
+   dst.rq_last = src.rq_last
+  }
+  else {}
+  end
+ }
+ else dst = src
+ end;
+ *dstp = dst;
+ *srcp = null()
+};
+
+//The current running Pid
+pid_self : Pid;
+memory pid_self;
+
+//If a process calls yield directly, it's not added to the runQueue;
+//yieldP does so.
+//That lets a process yield without awaiting some event.
+yieldP : () -> ();
+yieldP() := {
+ liven pid_self;
+ yieldCo()
+ };
+
+//Events are simply pointers to RunQueues.
+type Event = MPtr RunQueue;
+
+//Run processes until the queue is empty.
+//TODO return a null from pop_rq instead of a Nothing if the queue is empty?
+//Opt: pids are run in FIFO order and occur in at most one queue.
+//No other function pops from &runQueue, so to iterate over all pids in the
+//queue you can simply follow the right pointers and null the queue when
+//done.
+//Deferred pop is problematic: consider a queue with a single pid, which then
+//yieldP's. The pid would refer to itself, which should never happen!
+//Switching to a naive algo to avoid deadlock:
+//Note this function zeroes pid_self on completion; it may not be called from
+//within a running process. One could perhaps save and restore the pid...
+pid_scheduler : () -> ();
+pid_scheduler() :=
+ while(True) {
+  var pid;
+  case pop_rq (&runQueue) of {
+   Nothing => {pid_self = null();break};
+   Just pid => {
+   //Ensure pid_self always refers to the current running pid,
+   //then run it.
+   pid_self = pid;
+   resumeCo(Co (&((pid.unPid)->pid_co)))
+   }
+  }
+ };
+
+//Liven the first awaiter of an event, if any.
+notifyOne : Event -> ();
+notifyOne rqp := {
+ var pid;
+ case pop_rq rqp of {
+  Nothing => {};
+  Just pid => liven pid
+  }
+};
+//Liven all awaiters of an event.
+notifyAll rqp :=
+ transferAll_rq(&runQueue,rqp);
+//Await an event.
+//yieldP() ~ await (&runQueue)
+await : Event -> ();
+await evt := {
+ append_rq(evt,pid_self);
+ yieldCo()
+ };
+
+/*
+An abortive genserver implementation, retained because it may be interesting
+to the reader.
+Genservers in Erlang simulate object-like functionality despite the BEAM's
+isolation. Synchronous genserver calls in EVMC are pointless: you might as
+well use a closure protected by a lock (which is what I do in TestActor)
+since there is no isolation between procs.
+Async genserver calls could still be worth implementing.
+One downside of the closure approach is that the handler function must take
+and modify a pointer: its type is (MPtr c,a) -> b instead of (a,c) -> (b,c).
+
+//A simple message channel akin to a Haskell MVar; holds up to one message.
+type MsgChan = MsgChan_ Memory;
+data MsgChan_ r a = {MsgChan{
+ mc_msg: a,
+ mc_full: Bool,
+ mc_full_evt: RunQueue,
+ mc_empty_evt: RunQueue
+ }
+} region r;
+newMsgChan : () -> MsgChan a;
+newMsgChan() := return MsgChan {};
+
+//Blocks if the channel is full
+sendChan : (MsgChan a, a) -> ();
+sendChan(mc,a) := {
+ logResult(coerce 0xd, coerce (mc.mc_full));
+ if mc.mc_full
+ then await(&(mc.mc_empty_evt))
+ else {}
+ end;
+ mc.mc_full = True;
+ mc.mc_msg = a;
+ notifyOne(&(mc.mc_full_evt))
+ };
+
+//Receive a message from the channel. If empty, blocks until it's full.
+receiveChan : MsgChan a -> a;
+receiveChan mc := {
+ logResult(coerce 0xe, coerce (mc.mc_full));
+ if mc.mc_full
+ then {}
+ else await(&(mc.mc_full_evt))
+ end;
+ mc.mc_full = False;
+ if mc.mc_empty_evt
+ then notifyOne (&(mc.mc_empty_evt))
+ else mc.mc_full = False
+ end;
+ return mc.mc_msg
+ };
+
+//A typed miniature genserver!
+//genserver calls should pass and receive their arguments in order, so
+//they should only need two channels.
+//The Pid can be obscured; users should not liven the worker as it awaits
+//arguments.
+data GenServer a b = {GenServer {
+ gs_arg: MsgChan a,
+ gs_ret: MsgChan b,
+ }
+};
+spawn_gen_server : (Short,(a,s) -> (b,s),s) -> GenServer a b;
+spawn_gen_server (len,f,s) := {
+ var gs = GenServer (MsgChan{}) (MsgChan{});
+ spawn(len,gen_server,(f,s,gs));
+ return gs
+ };
+//Receives arguments and returns results in a loop, updating the on-stack
+//state. Internal to spawn_gen_server
+gen_server : ((a,s) -> (b,s), s, GenServer a b) -> ();
+gen_server (f,s,gs) := {
+ //logResult(Charles,0xeeee); //Charles starts at least!
+ var a,b;
+ while(a = receiveChan (gs.gs_arg)) {
+  //logResult(Charles,0xffff);
+  (b,s) = f(a,s);
+  sendChan(gs.gs_ret,b)
+  }
+  };
+//Call a genserver.
+gen_server_call : (GenServer a b, a) -> b;
+gen_server_call (gs,a) := {
+ sendChan(gs.gs_arg,a);
+ var b = receiveChan(gs.gs_ret);
+ //logResult(coerce 0xee,0xbebe);
+ return b
+ };
+
+End of the abortive genserver implementation.
+*/
+
+
+//A synchronous genserver might as well just be a lock on a closure...
+//First I'll implement Lock.
+type Lock = Lock_ Memory;
+data Lock_ r = {Lock{
+ locked: Bool,
+ unlock_evt: RunQueue
+ }
+ } region r;
+//Lock{} is coincidentally the right initial state...
+//but it might have the wrong region unless you constrain it!
+newLock : () -> Lock;
+newLock() := return Lock{};
+
+lockLock : Lock -> ();
+lockLock lock := {
+ if lock.locked
+ then await(&(lock.unlock_evt))
+ else {}
+ end;
+ lock.locked = True
+ };
+//Note that locked is only unset if the queue is empty. If it's always unset
+//mutex would not be guaranteed due to this trace:
+//Alice claims the lock
+//Bob is blocked on the lock
+//Alice releases the lock, livening Bob
+//Alice claims the lock
+//Now both Alice and Bob are in the critical section!
+unlockLock : Lock -> ();
+unlockLock lock :=
+ if lock.locked
+ then notifyOne(&(lock.unlock_evt))
+ else lock.locked = False
+ end;
+ 
+//I'll reimplement Closure rather than import EVMCPP
+data Hidden = {};
+data SyncedClosure a b = {SC {
+ sc_fptr: (MPtr Hidden, a) -> b,
+ sc_closed: MPtr Hidden,
+ sc_lock: Lock
+ }
+ };
+
+//Not needing to introduce a Ptr is an advantage of a genserver...
+newSyncedClosure : ((MPtr c,a) -> b, c) -> SyncedClosure a b;
+newSyncedClosure(f,c) := return SC {
+ sc_fptr: coerce f,
+ sc_closed: coerce (allocValue c),
+ sc_lock: newLock()
+ };
+callSyncedClosure : (SyncedClosure a b, a) -> b;
+callSyncedClosure(sc,a) := {
+ lockLock (sc.sc_lock);
+ var b = sc.sc_fptr(sc.sc_closed,a);
+ unlockLock (sc.sc_lock);
+ return b
+ };

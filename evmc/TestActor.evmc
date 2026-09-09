@@ -1,0 +1,75 @@
+import Prelude;
+import Actor;
+
+//A simple example: spawn two workers that interact with a critical section
+//closure protected by a lock.
+
+//The type of requests passed to the closure.
+data Req = {Get;Inc Short};
+
+//If sc_ctr_handler is synchronous, the scheduling behavior isn't very
+//interesting: Alice just calls Inc 1 ten times, then Bob calls Get 10 times.
+//I'll add a yieldP() to simulate a nontrivial async function.
+sc_ctr_handler : (MPtr Short, Req) -> Short;
+sc_ctr_handler(ps,r) := {
+ yieldP();
+ var delta; 
+ case r of {
+  Get => return *ps;
+  Inc delta => {
+   var s = *ps;
+   *ps += delta;
+   return s
+   }
+  }
+ };
+type Ctr = SyncedClosure Req Short;
+newCtr : () -> Ctr;
+newCtr() := return newSyncedClosure(sc_ctr_handler,1);
+
+//The two workers are named Alice and Bob.
+data Worker = {Alice;Bob;};
+//Let's make their hex values readable:
+tag Worker = Byte where {Alice: 0xa, Bob: 0xb};
+//A global for logging and returning genserver request results:
+gs_log: Array 100 (Struct(Worker,Short));
+memory gs_log;
+gs_ix: Short;
+memory gs_ix;
+logResult : (Worker,Short) -> ();
+logResult(w,s) := gs_log!(gs_ix++) = Struct(w,s);
+
+//Alice sends 10 increments and records the result:
+alice : Ctr -> ();
+alice ctr := {
+ logResult(Alice,0xdead);
+ for(var i = 0; i < 10; i++)
+  logResult(Alice,callSyncedClosure(ctr,Inc 1))
+ };
+//Bob sends 10 gets and records the result:
+bob : Ctr -> ();
+bob ctr := {
+ logResult(Bob,0xbeef);
+ for(var i = 0; i < 10; i++)
+  logResult(Bob,callSyncedClosure(ctr,Get))
+ };
+
+//The setup also runs in a process.
+setup: () -> ();
+setup() := {
+ var ctr = newCtr();
+ spawn(10,alice,ctr);
+ spawn(10,bob,ctr)
+ };
+
+main() := {
+ memAllocPtr = coerce (&memOffset);
+ callable setup;
+ callable alice;
+ callable bob;
+ callable sc_ctr_handler;
+ spawn(10,setup,());
+ pid_scheduler();
+ //Return the log in-place.
+ returnPtr (&gs_log)
+}

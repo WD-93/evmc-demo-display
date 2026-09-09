@@ -1,0 +1,6 @@
+//Separating out the text of TestActor in order to be able to load it in CLI.hs
+import Creation;
+constructor():={};
+contract text {
+ import TestActor
+ }
