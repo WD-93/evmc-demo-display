@@ -1,0 +1,120 @@
+//A case study of using coroutines to implement protocols.
+//The execution state (globals and coroutine) is persisted across calls;
+//the calldata consists of execution state followed by the next protocol
+//message. A future version could be optimized to take a batch of messages
+//instead.
+//The uploaded exec state is compared against a hash at storage[0]; since
+//initializing the contract with the hash of the first exec state would be a
+//pain in the neck, I instead avoid the check and init if !storage[0].
+
+import Creation;
+constructor() := {};
+contract text {
+
+import Prelude;
+import Coroutine;
+
+main() := {
+ callable protocol;
+ memAllocPtr = coerce (&memOffset);
+ var h = sload 0;
+ if h
+ then {
+ //Load exec state from calldata
+ calldatacopy(0,0,coerce (msgOffset()));
+ requireMsg (0xaaaa,hashExecState() == h);
+ }
+ else {
+ //Initialize
+ myProtocol = newCo(coWords(),protocol,());
+ //Progress the newly created coroutine to the first receive
+ resumeCo myProtocol
+ }
+ end;
+ //Resume
+ resumeCo myProtocol;
+ //Persist the execution state
+ sstore (0,hashExecState());
+ //Return the execution state for convenience
+ evm_return(0,coerce (msgOffset()))
+};
+
+//A handle to the protocol coroutine is stored in a global; one could also
+//just use &memOffset since it's the only thing I allocate, but that's more
+//fragile.
+myProtocol : Coroutine;
+memory myProtocol;
+
+//Helper function for hashing current execution state
+hashExecState : () -> Word;
+hashExecState() := return sha3(0,coerce (msgOffset()));
+
+requireMsg : (Short,Bool) -> ();
+requireMsg (msg,b) :=
+ if b
+ then return ()
+ else revertValue msg
+ end;
+
+//The byte size of the execution state.
+msgOffset : () -> Short;
+msgOffset() :=
+ return coerce (&memOffset)        //Globals
+      + sizeof (P :: P Coroutine_) //Coroutine header
+      + (coWords() << 5);          //Coroutine stack
+//The number of coroutine stack words.
+coWords : () -> Short;
+coWords() := return 20;
+
+//Yield from the coroutine, leaving persistence to main; on resumption
+//load the next protocol message from calldata.
+receive : () -> a;
+receive() := {
+ yieldCo();
+ return *(coerce (msgOffset()) :: Ptr Calldata a)
+ };
+
+//The response to a proposed 16b prime; either a fraud proof (factor) or
+//timeout.
+data Response = {
+ Timeout;
+ Factor Short
+ };
+
+//Annoyance: the timestamp gets included in the execution state during propose,
+//and if the simulated and actual call occur in different seconds then the
+//simulated hash won't match the actual one.
+//Reducing precision to 60s; in a production system one could trace the EVM
+//instead.
+time : () -> Word;
+time() := return (timestamp() / 60) * 60;
+
+//Protocol: the prover proposes candidate primes, while the opponent has 60
+//seconds to submit a fraud proof (i.e. a proof the candidate is composite)
+//before a timeout message is accepted and the candidate is added to the
+//prime list (starting at slot 1).
+protocol : () -> ();
+protocol() := {
+ var ix = 1;
+ while (True) {
+ //Preventing the optimizer from freaking out because of the infinite loop:
+ if secretlyFalse()
+ then return ()
+ else {}
+ end;
+ var n = receive() :: Short; //Receive proposed 16-bit prime
+ requireMsg (0xbbbb, n > 1);
+ var t = time();
+ var factor;
+ case receive() of { //Contest or time out
+  Timeout => {
+   requireMsg (0xcccc, time() >= t + 60);
+   sstore(ix++, coerce n)
+  };
+  Factor factor =>
+   requireMsg (0xdddd, (factor > 1) & (factor < n) & ((n % factor) == 0))
+  }
+ }
+}
+
+}
